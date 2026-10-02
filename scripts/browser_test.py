@@ -25,6 +25,13 @@ SHOT = sys.argv[2] if len(sys.argv) > 2 else ""
 DEBUG_PORT = int(os.environ.get("LAN_SHARE_DEBUG_PORT", "9333"))
 PAYLOAD_MIB = 12
 
+# 同 e2e_test.py：Windows 控制台默认 cp1252，中文输出会抛 UnicodeEncodeError
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 passed = 0
 failed = []
 

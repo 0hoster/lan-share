@@ -23,6 +23,14 @@ BASE = (sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:18080").rstrip("
 TOKEN = sys.argv[2] if len(sys.argv) > 2 else ""
 PARALLEL = 4
 
+# Windows 上 Python 默认用 cp1252 输出，打印中文检查名会直接抛
+# UnicodeEncodeError 把测试打死，这里强制 UTF-8。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 passed = 0
 failed = []
 

@@ -16,6 +16,12 @@ BASE = (sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:18080").rstrip("
 SIZE_MIB = int(sys.argv[2] if len(sys.argv) > 2 else 256)
 LANES = [1, 4, 8]
 
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 
 def request(path, method="GET", data=None, headers=None):
     req = urllib.request.Request(BASE + path, data=data, method=method)

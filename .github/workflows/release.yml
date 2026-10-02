@@ -74,6 +74,10 @@ jobs:
 
       - name: 启动服务并跑端到端测试
         shell: bash
+        env:
+          # Windows runner 默认 cp1252，中文输出会让测试脚本抛 UnicodeEncodeError
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
         run: |
           # GitHub 会给 bash 步骤隐式加上 -e（bash -eo pipefail），必须显式关掉，
           # 否则测试一旦非零退出，步骤会立刻结束，下面的诊断输出全部丢失。
