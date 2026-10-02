@@ -46,6 +46,7 @@ pub struct Stats {
     pub files: usize,
     pub bytes: u64,
     pub uploads: usize,
+    pub live: usize,
     pub uptime_secs: u64,
     pub chunk_size: u64,
 }
@@ -54,8 +55,21 @@ pub struct Stats {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
+    /// 新增文件（目前用于直播录像落盘）
+    FileAdded {
+        file: FileMeta,
+    },
     FileRemoved {
         id: Uuid,
+    },
+    /// 有新的直播开始
+    LiveStarted {
+        room_id: String,
+        title: String,
+    },
+    /// 直播结束（含主播手动结束与超时自动结束）
+    LiveEnded {
+        room_id: String,
     },
     UploadStarted {
         upload_id: Uuid,

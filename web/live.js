@@ -1,0 +1,656 @@
+/* lan-share 直播录屏
+ * 推送端：getDisplayMedia / getUserMedia → MediaRecorder 分片 → PUT /api/live/{id}/chunk
+ * 观看端：WebSocket 收分片 → MediaSource 播放（延迟约 1~3 秒）
+ */
+(() => {
+  'use strict';
+
+  const $ = (sel) => document.querySelector(sel);
+
+  const state = {
+    token: new URLSearchParams(location.search).get('token') || localStorage.getItem('lan-share-token') || '',
+    rooms: [],
+    cast: null,   // 推流中的会话
+    player: null, // 观看中的会话
+  };
+
+  // ---------------------------------------------------------------- 工具
+
+  const withToken = (url) =>
+    state.token ? url + (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(state.token) : url;
+
+  const authHeaders = (extra) => {
+    const headers = Object.assign({}, extra || {});
+    if (state.token) headers['Authorization'] = 'Bearer ' + state.token;
+    return headers;
+  };
+
+  const wsUrl = (path) => {
+    const base = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + path;
+    return state.token ? base + (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(state.token) : base;
+  };
+
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  function fmtBytes(n) {
+    if (!Number.isFinite(n) || n < 0) return '—';
+    if (n < 1024) return n + ' B';
+    const units = ['KB', 'MB', 'GB'];
+    let value = n / 1024;
+    let i = 0;
+    while (value >= 1024 && i < units.length - 1) { value /= 1024; i++; }
+    return value.toFixed(value >= 100 ? 0 : 1) + ' ' + units[i];
+  }
+
+  function fmtDuration(seconds) {
+    if (!Number.isFinite(seconds) || seconds < 0) return '—';
+    const s = Math.floor(seconds % 60);
+    const m = Math.floor((seconds / 60) % 60);
+    const h = Math.floor(seconds / 3600);
+    const mm = String(m).padStart(2, '0');
+    const ss = String(s).padStart(2, '0');
+    return h > 0 ? `${h}:${mm}:${ss}` : `${m}:${ss}`;
+  }
+
+  function escapeHtml(str) {
+    return String(str).replace(/[&<>"']/g, (c) =>
+      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+  }
+
+  function toast(message, kind = '') {
+    const el = document.createElement('div');
+    el.className = 'toast ' + kind;
+    el.textContent = message;
+    $('#toasts').appendChild(el);
+    setTimeout(() => {
+      el.style.opacity = '0';
+      el.style.transition = 'opacity .3s';
+      setTimeout(() => el.remove(), 320);
+    }, 4200);
+  }
+
+  async function parseError(resp) {
+    try {
+      const data = await resp.json();
+      if (data && data.error) return data.error;
+    } catch (_) { /* ignore */ }
+    return 'HTTP ' + resp.status;
+  }
+
+  // ---------------------------------------------------------------- 标签页
+
+  function bindTabs() {
+    const tabs = Array.from(document.querySelectorAll('#tabs .tab'));
+    tabs.forEach((tab) => {
+      tab.addEventListener('click', () => activate(tab.dataset.tab));
+    });
+    if (location.hash === '#live') activate('live');
+  }
+
+  function activate(name) {
+    document.querySelectorAll('#tabs .tab').forEach((tab) => {
+      tab.classList.toggle('active', tab.dataset.tab === name);
+    });
+    document.querySelectorAll('.panel').forEach((panel) => {
+      panel.hidden = panel.dataset.panel !== name;
+    });
+    if (name === 'live') {
+      describeSupport();
+      loadRooms();
+    }
+    history.replaceState(null, '', name === 'live' ? '#live' : '#files');
+  }
+
+  function describeSupport() {
+    const hint = $('#live-support');
+    if (!window.MediaRecorder || !navigator.mediaDevices) {
+      hint.textContent = '当前浏览器不支持录屏推送，请用 Chrome / Edge / Firefox';
+      $('#live-start-screen').disabled = true;
+      $('#live-start-camera').disabled = true;
+      return;
+    }
+    const mime = pickMime();
+    hint.textContent = mime ? '编码：' + mime.replace('video/webm;codecs=', '') : '当前浏览器不支持 WebM 录制';
+    if (!mime) {
+      $('#live-start-screen').disabled = true;
+      $('#live-start-camera').disabled = true;
+    }
+  }
+
+  /** 分片编码必须和实际音轨匹配：没有音轨却声明 opus，播放端会初始化失败 */
+  function pickMime(wantAudio) {
+    if (!window.MediaRecorder || !MediaRecorder.isTypeSupported) return '';
+    const candidates = wantAudio
+      ? [
+          'video/webm;codecs=vp8,opus',
+          'video/webm;codecs=vp9,opus',
+          'video/webm',
+        ]
+      : [
+          'video/webm;codecs=vp8',
+          'video/webm;codecs=vp9',
+          'video/webm',
+        ];
+    return candidates.find((m) => MediaRecorder.isTypeSupported(m)) || '';
+  }
+
+  // ---------------------------------------------------------------- 房间列表
+
+  async function loadRooms() {
+    try {
+      const resp = await fetch(withToken('/api/live/rooms'), { headers: authHeaders() });
+      if (!resp.ok) throw new Error(await parseError(resp));
+      state.rooms = await resp.json();
+      renderRooms();
+    } catch (err) {
+      toast('读取直播列表失败：' + err.message, 'err');
+    }
+  }
+
+  function renderRooms() {
+    const list = $('#live-list');
+    list.innerHTML = '';
+    $('#live-count').textContent = state.rooms.length ? `(${state.rooms.length})` : '';
+    $('#live-empty').hidden = state.rooms.length > 0;
+
+    for (const room of state.rooms) {
+      const mine = state.cast && state.cast.roomId === room.id;
+      const seconds = Math.max(0, Math.floor(Date.now() / 1000) - room.started_at);
+      const li = document.createElement('li');
+      li.className = 'row';
+      li.innerHTML = `
+        <span class="icon">${room.recording ? '⏺' : '📡'}</span>
+        <div class="grow">
+          <div class="name" title="${escapeHtml(room.title)}">${escapeHtml(room.title)}${mine ? ' <span class="tag">我的直播</span>' : ''}</div>
+          <div class="meta">
+            <span>已直播 ${fmtDuration(seconds)}</span>
+            <span>${room.viewers} 人观看</span>
+            <span>${fmtBytes(room.bytes)}</span>
+            ${room.recording ? '<span>正在录像</span>' : ''}
+          </div>
+        </div>
+        <div class="actions">
+          <button class="act primary" data-watch type="button">观看</button>
+          ${mine ? '<button class="act danger" data-stop type="button">结束</button>' : ''}
+        </div>`;
+      li.querySelector('[data-watch]').onclick = () => watchRoom(room);
+      const stopButton = li.querySelector('[data-stop]');
+      if (stopButton) stopButton.onclick = () => stopBroadcast();
+      list.appendChild(li);
+    }
+  }
+
+  // ---------------------------------------------------------------- 开播
+
+  async function startBroadcast(source) {
+    if (state.cast) {
+      toast('已经在直播中', 'err');
+      return;
+    }
+    let captured;
+    try {
+      captured = source === 'screen'
+        ? await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 24 }, audio: true })
+        : await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720, frameRate: 24 } });
+    } catch (err) {
+      toast('没有拿到采集源：' + (err && err.message ? err.message : err), 'err');
+      return;
+    }
+
+    let stream = captured;
+    if ($('#live-mic').checked) {
+      try {
+        const mic = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream = mixAudio(captured, mic);
+      } catch (err) {
+        toast('麦克风不可用，仅使用原有声音轨', 'err');
+      }
+    }
+
+    // 编码声明必须与实际音轨一致，否则观看端 MSE 初始化会失败
+    const mime = pickMime(stream.getAudioTracks().length > 0);
+    if (!mime) {
+      captured.getTracks().forEach((track) => track.stop());
+      toast('当前浏览器不支持 WebM 录制，无法开播', 'err');
+      return;
+    }
+
+    const title = $('#live-title').value.trim() || (source === 'screen' ? '屏幕直播' : '摄像头直播');
+    const record = $('#live-record').checked;
+
+    let session;
+    try {
+      const resp = await fetch(withToken('/api/live/start'), {
+        method: 'POST',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ title, mime, record }),
+      });
+      if (!resp.ok) throw new Error(await parseError(resp));
+      session = await resp.json();
+    } catch (err) {
+      captured.getTracks().forEach((track) => track.stop());
+      toast('开播失败：' + err.message, 'err');
+      return;
+    }
+
+    const cast = {
+      roomId: session.room_id,
+      key: session.key,
+      title,
+      mime,
+      stream,
+      captured,
+      queue: [],
+      sending: false,
+      stopping: false,
+      bytes: 0,
+      chunks: 0,
+      viewers: 0,
+      speed: 0,
+      startedAt: performance.now(),
+      lastBytes: 0,
+      lastAt: performance.now(),
+      failed: false,
+    };
+    state.cast = cast;
+
+    const recorder = new MediaRecorder(stream, {
+      mimeType: mime,
+      videoBitsPerSecond: 4_000_000,
+      audioBitsPerSecond: 128_000,
+    });
+    cast.recorder = recorder;
+    recorder.ondataavailable = (event) => {
+      if (!event.data || event.data.size === 0) return;
+      if (cast.settled) return; // 已经收尾完毕，丢弃迟到的分片
+      cast.queue.push(event.data);
+      pumpQueue();
+    };
+    recorder.onerror = (event) => fail('录制出错：' + (event.error && event.error.name));
+
+    // 用户点浏览器自带的「停止共享」时同步结束
+    captured.getVideoTracks().forEach((track) => {
+      track.addEventListener('ended', () => { if (!cast.stopping) stopBroadcast(); });
+    });
+
+    recorder.start(1000);
+
+    $('#live-preview').srcObject = stream;
+    $('#live-preview').play().catch(() => { /* 预览失败不影响推流 */ });
+    $('#live-self').hidden = false;
+    $('#live-title').disabled = true;
+    $('#live-start-screen').disabled = true;
+    $('#live-start-camera').disabled = true;
+    loadRooms();
+    toast('已开播：' + title, 'ok');
+  }
+
+  /** 把系统声音与麦克风混成一条音轨 */
+  function mixAudio(videoStream, micStream) {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const destination = ctx.createMediaStreamDestination();
+    if (videoStream.getAudioTracks().length > 0) {
+      ctx.createMediaStreamSource(new MediaStream(videoStream.getAudioTracks())).connect(destination);
+    }
+    ctx.createMediaStreamSource(micStream).connect(destination);
+    const mixed = new MediaStream([
+      ...videoStream.getVideoTracks(),
+      ...destination.stream.getAudioTracks(),
+    ]);
+    mixed.__keepAlive = { ctx, micStream };
+    return mixed;
+  }
+
+  /** 顺序把分片推给服务端（顺序发送可以保证时间戳单调） */
+  async function pumpQueue() {
+    const cast = state.cast;
+    if (!cast || cast.sending) return;
+    cast.sending = true;
+    while (cast.queue.length && !cast.failed) {
+      const blob = cast.queue.shift();
+      try {
+        const resp = await fetch(withToken(`/api/live/${cast.roomId}/chunk`), {
+          method: 'PUT',
+          headers: authHeaders({
+            'Content-Type': 'application/octet-stream',
+            'x-live-key': cast.key,
+          }),
+          body: blob,
+        });
+        if (!resp.ok) throw new Error(await parseError(resp));
+        const info = await resp.json();
+        cast.bytes = info.bytes;
+        cast.chunks = info.seq + 1;
+        cast.viewers = info.viewers;
+      } catch (err) {
+        fail('推流中断：' + err.message);
+        break;
+      }
+    }
+    cast.sending = false;
+    updateCastStats();
+  }
+
+  function fail(message) {
+    const cast = state.cast;
+    if (!cast) return;
+    cast.failed = true;
+    toast(message, 'err');
+    stopBroadcast();
+  }
+
+  async function stopBroadcast() {
+    const cast = state.cast;
+    if (!cast || cast.stopping) return;
+    cast.stopping = true;
+
+    // 先等录制器把最后一个分片吐出来，否则那一片会在房间结束后才发出
+    const recorderDone = new Promise((resolve) => {
+      const recorder = cast.recorder;
+      if (!recorder || recorder.state === 'inactive') {
+        resolve();
+        return;
+      }
+      recorder.addEventListener('stop', () => resolve(), { once: true });
+      try {
+        recorder.stop();
+      } catch (_) {
+        resolve();
+      }
+    });
+    await Promise.race([recorderDone, sleep(3000)]);
+
+    // 等剩余分片推完（最多 8 秒），避免丢掉最后一小段
+    const deadline = Date.now() + 8000;
+    while ((cast.queue.length > 0 || cast.sending) && Date.now() < deadline) {
+      await sleep(200);
+    }
+    cast.settled = true;
+
+    try {
+      const resp = await fetch(withToken(`/api/live/${cast.roomId}/stop`), {
+        method: 'POST',
+        headers: authHeaders({ 'x-live-key': cast.key }),
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        toast(data.saved ? '直播已结束，录像已保存：' + data.saved.name : '直播已结束', 'ok');
+      } else {
+        toast('结束直播失败：' + await parseError(resp), 'err');
+      }
+    } catch (err) {
+      toast('结束直播失败：' + err.message, 'err');
+    }
+    cleanupCast(cast);
+  }
+
+  function cleanupCast(cast) {
+    try {
+      cast.stream.getTracks().forEach((track) => track.stop());
+      cast.captured.getTracks().forEach((track) => track.stop());
+      if (cast.stream.__keepAlive) {
+        cast.stream.__keepAlive.micStream.getTracks().forEach((track) => track.stop());
+        cast.stream.__keepAlive.ctx.close();
+      }
+    } catch (_) { /* ignore */ }
+    if (state.cast === cast) state.cast = null;
+    $('#live-preview').srcObject = null;
+    $('#live-self').hidden = true;
+    $('#live-title').disabled = false;
+    $('#live-start-screen').disabled = false;
+    $('#live-start-camera').disabled = false;
+    loadRooms();
+  }
+
+  function updateCastStats() {
+    const cast = state.cast;
+    if (!cast) return;
+    const now = performance.now();
+    const dt = (now - cast.lastAt) / 1000;
+    if (dt > 0.5) {
+      cast.speed = Math.max(0, (cast.bytes - cast.lastBytes) / dt);
+      cast.lastBytes = cast.bytes;
+      cast.lastAt = now;
+    }
+    const elapsed = (now - cast.startedAt) / 1000;
+    $('#live-stats').innerHTML =
+      `<span>已推流 ${fmtBytes(cast.bytes)}</span>` +
+      `<span>${fmtDuration(elapsed)}</span>` +
+      `<span>${fmtBytes(cast.speed)}/s</span>` +
+      `<span>${cast.viewers} 人观看</span>` +
+      (cast.failed ? '<span class="err-text">已中断</span>' : '');
+  }
+
+  // ---------------------------------------------------------------- 观看
+
+  function watchRoom(room) {
+    closePlayer();
+    const card = $('#live-player-card');
+    card.hidden = false;
+    $('#live-player-title').textContent = room.title;
+    setStatus('正在连接…');
+    card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+
+    const video = $('#live-player');
+    const source = new MediaSource();
+    const objectUrl = URL.createObjectURL(source);
+    const player = {
+      room, source, objectUrl, video,
+      sb: null, queue: [], current: null, appending: false,
+      bytes: 0, ws: null, closed: false, info: null,
+    };
+    state.player = player;
+    video.src = objectUrl;
+    video.play().catch(() => { /* 需要用户手势时由控件接管 */ });
+
+    source.addEventListener('sourceopen', () => {
+      try {
+        player.sb = source.addSourceBuffer(normalizeMime(room.mime));
+      } catch (_) {
+        try {
+          player.sb = source.addSourceBuffer('video/webm');
+        } catch (_) {
+          setStatus('当前浏览器无法播放该编码，建议用 Chrome / Edge 观看');
+          return;
+        }
+      }
+      player.sb.mode = 'segments';
+      player.sb.addEventListener('updateend', onUpdateEnd);
+      connect(player);
+      pump();
+    });
+  }
+
+  /** MSE 要求 codecs 参数加引号，例如 video/webm;codecs="vp8,opus" */
+  function normalizeMime(mime) {
+    const raw = (mime || 'video/webm').trim();
+    const match = raw.match(/^(.*?codecs\s*=\s*)([^;"]+)(.*)$/i);
+    if (!match) return raw;
+    const list = match[2].trim().replace(/^"|"$/g, '');
+    return `${match[1]}"${list}"${match[3]}`;
+  }
+
+  function connect(player) {
+    const ws = new WebSocket(wsUrl(`/api/live/${player.room.id}/ws`));
+    player.ws = ws;
+    ws.binaryType = 'arraybuffer';
+    ws.onmessage = (event) => {
+      if (typeof event.data === 'string') {
+        let msg;
+        try { msg = JSON.parse(event.data); } catch (_) { return; }
+        if (msg.type === 'ended') {
+          player.closed = true;
+          setStatus('直播已结束');
+          try { ws.close(); } catch (_) { /* ignore */ }
+        } else if (msg.type === 'lagged') {
+          setStatus('网络较慢，正在重新同步…');
+          reconnect();
+        } else if (msg.type === 'info') {
+          player.info = msg.room;
+        }
+        return;
+      }
+      player.bytes += event.data.byteLength;
+      player.queue.push(new Uint8Array(event.data));
+      pump();
+    };
+    ws.onclose = () => {
+      if (!player.closed && state.player === player) {
+        player.closed = true;
+        setStatus('连接已断开');
+      }
+    };
+  }
+
+  function reconnect() {
+    const player = state.player;
+    if (!player) return;
+    const room = player.room;
+    closePlayer();
+    setTimeout(() => watchRoom(room), 300);
+  }
+
+  function onUpdateEnd() {
+    const player = state.player;
+    if (!player || !player.sb) return;
+    if (player.appending) {
+      player.appending = false;
+      player.current = null;
+    }
+    pump();
+    followLiveEdge();
+  }
+
+  function pump() {
+    const player = state.player;
+    if (!player || !player.sb || player.closed || player.sb.updating) return;
+    if (!player.current) {
+      if (!player.queue.length) {
+        followLiveEdge();
+        return;
+      }
+      player.current = player.queue.shift();
+    }
+    try {
+      player.sb.appendBuffer(player.current);
+      player.appending = true;
+    } catch (err) {
+      if (err && err.name === 'QuotaExceededError') {
+        evictOld();
+        return;
+      }
+      player.current = null;
+      setStatus('播放出错：' + (err && err.message ? err.message : err));
+    }
+  }
+
+  /** 缓冲区过大时丢掉最旧的一段，给新数据腾地方 */
+  function evictOld() {
+    const player = state.player;
+    if (!player || !player.sb) return;
+    const buffered = player.video.buffered;
+    if (!buffered.length || buffered.end(buffered.length - 1) - buffered.start(0) < 12) {
+      player.current = null;
+      pump();
+      return;
+    }
+    const start = buffered.start(0);
+    const end = buffered.end(buffered.length - 1);
+    try {
+      player.sb.remove(start, Math.max(start + 1, end - 8));
+    } catch (_) {
+      player.current = null;
+      pump();
+    }
+  }
+
+  /** 尽量贴着直播点播放，落后太多就跳一下 */
+  function followLiveEdge() {
+    const player = state.player;
+    if (!player) return;
+    const video = player.video;
+    if (!video.buffered.length) return;
+    const edge = video.buffered.end(video.buffered.length - 1);
+    if (video.paused) video.play().catch(() => { /* ignore */ });
+    const lag = edge - video.currentTime;
+    if (lag > 4) video.currentTime = Math.max(0, edge - 1);
+    updatePlayerStatus(Math.max(0, lag));
+  }
+
+  function updatePlayerStatus(lag) {
+    const player = state.player;
+    if (!player) return;
+    const started = player.info ? player.info.started_at : 0;
+    const elapsed = started ? Math.max(0, Math.floor(Date.now() / 1000) - started) : 0;
+    const viewers = player.info ? player.info.viewers : 0;
+    const recording = player.info && player.info.recording ? '<span>主播正在录像</span>' : '';
+    $('#live-player-status').innerHTML =
+      `<span>已直播 ${fmtDuration(elapsed)}</span>` +
+      `<span>落后直播点 ${lag.toFixed(1)} 秒</span>` +
+      `<span>已接收 ${fmtBytes(player.bytes)}</span>` +
+      `<span>${viewers} 人观看</span>` + recording;
+  }
+
+  function setStatus(text) {
+    $('#live-player-status').innerHTML = `<span>${escapeHtml(text)}</span>`;
+  }
+
+  function closePlayer() {
+    const player = state.player;
+    if (!player) return;
+    player.closed = true;
+    try { player.ws && player.ws.close(); } catch (_) { /* ignore */ }
+    try { player.video.pause(); } catch (_) { /* ignore */ }
+    player.video.removeAttribute('src');
+    try { player.video.load(); } catch (_) { /* ignore */ }
+    URL.revokeObjectURL(player.objectUrl);
+    state.player = null;
+    $('#live-player-card').hidden = true;
+  }
+
+  // ---------------------------------------------------------------- 初始化
+
+  function bind() {
+    $('#live-start-screen').addEventListener('click', () => startBroadcast('screen'));
+    $('#live-start-camera').addEventListener('click', () => startBroadcast('camera'));
+    $('#live-stop').addEventListener('click', () => stopBroadcast());
+    $('#live-refresh').addEventListener('click', () => loadRooms());
+    $('#live-leave').addEventListener('click', () => closePlayer());
+
+    setInterval(updateCastStats, 500);
+    // 直播列表定时刷新（只在直播页可见时发请求）
+    setInterval(() => {
+      const panel = document.querySelector('.panel[data-panel="live"]');
+      if (panel && !panel.hidden) loadRooms();
+    }, 5000);
+  }
+
+  bindTabs();
+  describeSupport();
+  bind();
+
+  window.addEventListener('beforeunload', () => {
+    if (state.player) closePlayer();
+    if (state.cast) {
+      try { state.cast.recorder.stop(); } catch (_) { /* ignore */ }
+      try {
+        navigator.sendBeacon(
+          withToken(`/api/live/${state.cast.roomId}/stop`),
+          new Blob([], { type: 'text/plain' })
+        );
+      } catch (_) { /* ignore */ }
+    }
+  });
+
+  // 暴露给自动化测试使用的最小接口
+  window.__lanShareLive = {
+    startBroadcast,
+    stopBroadcast,
+    watchRoom,
+    closePlayer,
+    loadRooms,
+    get rooms() { return state.rooms; },
+    get cast() { return state.cast; },
+    get player() { return state.player; },
+  };
+})();

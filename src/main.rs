@@ -1,6 +1,7 @@
 mod api;
 mod assets;
 mod error;
+mod live;
 mod model;
 mod net;
 mod state;
@@ -82,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
             .with_context(|| format!("初始化数据目录失败: {}", data_dir.display()))?,
     );
     api::spawn_janitor(state.clone());
+    live::spawn_janitor(state.clone());
 
     let app = api::router(state.clone())
         .layer(CorsLayer::very_permissive())

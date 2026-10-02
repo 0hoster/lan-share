@@ -26,6 +26,12 @@
   </header>
 
   <main>
+    <nav class="tabs" id="tabs">
+      <button class="tab active" type="button" data-tab="files">文件传输</button>
+      <button class="tab" type="button" data-tab="live">直播录屏</button>
+    </nav>
+
+    <div class="panel" data-panel="files">
     <section class="card">
       <div id="dropzone" class="dropzone" tabindex="0" role="button" aria-label="选择或拖拽文件上传">
         <div class="dz-icon">⬆</div>
@@ -78,6 +84,50 @@
       <ul class="files" id="file-list"></ul>
       <p class="empty" id="empty-state">还没有文件，拖一个上来试试。</p>
     </section>
+    </div>
+
+    <div class="panel" data-panel="live" hidden>
+      <section class="card">
+        <div class="card-head">
+          <h2>开始直播</h2>
+          <span class="hint" id="live-support"></span>
+        </div>
+        <div class="live-form">
+          <input id="live-title" type="text" maxlength="60" placeholder="直播标题（可选，例如：会议室大屏）" />
+          <div class="live-opts">
+            <label class="field"><input type="checkbox" id="live-record" checked /> 保存录像到服务器</label>
+            <label class="field"><input type="checkbox" id="live-mic" /> 同时采集麦克风</label>
+          </div>
+          <div class="live-buttons">
+            <button class="act primary" id="live-start-screen" type="button">共享屏幕开播</button>
+            <button class="act" id="live-start-camera" type="button">摄像头开播</button>
+          </div>
+        </div>
+        <div id="live-self" hidden>
+          <video id="live-preview" muted playsinline></video>
+          <div class="meta" id="live-stats"></div>
+          <button class="act danger" id="live-stop" type="button">结束直播</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>正在直播 <span class="count" id="live-count"></span></h2>
+          <button class="ghost" id="live-refresh" type="button">刷新</button>
+        </div>
+        <ul class="files" id="live-list"></ul>
+        <p class="empty" id="live-empty">当前没有直播。点上面的按钮，把你的屏幕共享给局域网里的其他人。</p>
+      </section>
+
+      <section class="card" id="live-player-card" hidden>
+        <div class="card-head">
+          <h2 id="live-player-title">观看直播</h2>
+          <button class="ghost" id="live-leave" type="button">关闭</button>
+        </div>
+        <video id="live-player" controls playsinline autoplay></video>
+        <div class="meta" id="live-player-status"></div>
+      </section>
+    </div>
   </main>
 
   <footer class="foot">
@@ -86,5 +136,6 @@
 
   <div class="toasts" id="toasts"></div>
   <script src="/app.js"></script>
+  <script src="/live.js"></script>
 </body>
 </html>

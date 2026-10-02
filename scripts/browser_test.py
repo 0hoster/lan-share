@@ -44,7 +44,8 @@ class WebSocket:
 
     def __init__(self, url):
         parsed = urlparse(url)
-        self.sock = socket.create_connection((parsed.hostname, parsed.port or 80), timeout=30)
+        # 直播播放等待可能较久，超时放宽
+        self.sock = socket.create_connection((parsed.hostname, parsed.port or 80), timeout=120)
         key = base64.b64encode(os.urandom(16)).decode()
         path = parsed.path + (("?" + parsed.query) if parsed.query else "")
         handshake = (
@@ -197,6 +198,10 @@ def main():
         [
             chrome, "--headless=new", "--no-sandbox", "--disable-gpu",
             "--disable-dev-shm-usage", "--no-first-run", "--disable-extensions",
+            # 让 getUserMedia 直接返回合成音视频，便于无人值守地跑通「开播」链路
+            "--use-fake-ui-for-media-stream", "--use-fake-device-for-media-stream",
+            "--autoplay-policy=no-user-gesture-required",
+            "--no-proxy-server",
             f"--remote-debugging-port={DEBUG_PORT}", f"--user-data-dir={profile}",
             "--window-size=1280,900", "about:blank",
         ],
@@ -271,6 +276,99 @@ def main():
         check("浏览器并行 Range 下载完成", bool(download and download.get("ok")), download)
         if download and download.get("ok"):
             print(f"      下载耗时 {download['ms']} ms")
+
+        # ---------------------------------------------------------- 直播录屏链路
+        live_start_js = """
+        (async () => {
+          const live = window.__lanShareLive;
+          if (!live) return { ok: false, reason: 'live.js 未加载' };
+          document.querySelector('#tabs .tab[data-tab="live"]').click();
+          document.getElementById('live-title').value = '浏览器自动化直播';
+          document.getElementById('live-record').checked = true;
+          document.getElementById('live-start-camera').click();
+          const started = Date.now();
+          while (Date.now() - started < 30000) {
+            if (live.cast && live.cast.bytes > 0 && live.rooms.length > 0) {
+              return { ok: true, roomId: live.cast.roomId, bytes: live.cast.bytes, chunks: live.cast.chunks, rooms: live.rooms.length };
+            }
+            await new Promise(r => setTimeout(r, 300));
+          }
+          return { ok: false, reason: '开播超时' };
+        })()
+        """
+        live = cdp.evaluate(live_start_js)
+        check("浏览器开播（真实 MediaRecorder 采集）", bool(live and live.get("ok")), live)
+        if live and live.get("ok"):
+            print(f"      房间 {live['roomId']} 已推流 {live['bytes']} 字节 / {live['chunks']} 个分片")
+
+        live_watch_js = """
+        (async () => {
+          const live = window.__lanShareLive;
+          const button = document.querySelector('#live-list .row [data-watch]');
+          if (!button) return { ok: false, reason: '列表里没有可观看的直播' };
+          button.click();
+          const video = document.getElementById('live-player');
+          const started = Date.now();
+          while (Date.now() - started < 20000) {
+            if (video.readyState >= 2 && video.currentTime > 0.2) {
+              return {
+                ok: true,
+                currentTime: video.currentTime,
+                readyState: video.readyState,
+                buffered: video.buffered.length ? video.buffered.end(video.buffered.length - 1) : 0,
+                status: document.getElementById('live-player-status').innerText.trim(),
+              };
+            }
+            if ((document.getElementById('live-player-status').innerText || '').includes('已结束')) {
+              return { ok: false, reason: '直播提前结束' };
+            }
+            await new Promise(r => setTimeout(r, 300));
+          }
+          return {
+            ok: false,
+            reason: '播放超时',
+            status: document.getElementById('live-player-status').innerText.trim(),
+            readyState: video.readyState,
+            currentTime: video.currentTime,
+            wsState: live.player && live.player.ws ? live.player.ws.readyState : -1,
+            buffered: video.buffered.length,
+            error: video.error ? video.error.message || video.error.code : null,
+            received: live.player ? live.player.bytes : 0,
+          };
+        })()
+        """
+        playing = cdp.evaluate(live_watch_js)
+        check("观看端 MSE 实时播放成功", bool(playing and playing.get("ok")), playing)
+        if playing and playing.get("ok"):
+            print(f"      已播放到 {playing['currentTime']:.1f}s，缓冲 {playing['buffered']:.1f}s")
+
+        if SHOT:
+            shot = cdp.call("Page.captureScreenshot", {"format": "png", "captureBeyondViewport": True})
+            with open(SHOT.rsplit(".", 1)[0] + ".live.png", "wb") as handle:
+                handle.write(base64.b64decode(shot["data"]))
+            print(f"      直播页截图: {SHOT.rsplit('.', 1)[0]}.live.png")
+
+        live_stop_js = """
+        (async () => {
+          const live = window.__lanShareLive;
+          document.getElementById('live-stop').click();
+          const started = Date.now();
+          while (Date.now() - started < 30000) {
+            if (!live.cast) break;
+            await new Promise(r => setTimeout(r, 300));
+          }
+          await new Promise(r => setTimeout(r, 1500));
+          const toasts = document.getElementById('toasts').innerText || '';
+          document.querySelector('#tabs .tab[data-tab="files"]').click();
+          await new Promise(r => setTimeout(r, 800));
+          const names = Array.from(document.querySelectorAll('#file-list .name')).map(el => el.textContent);
+          return { ok: true, toasts: toasts.trim(), recording: names.some(n => n.includes('录屏-')) };
+        })()
+        """
+        stopped = cdp.evaluate(live_stop_js)
+        check("结束直播后生成录像文件", bool(stopped and stopped.get("recording")), stopped)
+        if stopped:
+            print(f"      提示: {stopped['toasts'][:80]}")
 
         if SHOT:
             shot = cdp.call("Page.captureScreenshot", {"format": "png", "captureBeyondViewport": True})
