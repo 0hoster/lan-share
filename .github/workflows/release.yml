@@ -83,6 +83,16 @@ jobs:
           # 否则测试一旦非零退出，步骤会立刻结束，下面的诊断输出全部丢失。
           set +e
           set -uo pipefail
+          # 输出带 ANSI 颜色，GitHub 会在控制字符处截断 annotation，先清干净；
+          # 失败时结尾信息（traceback）比开头重要，所以用 tail -c 取末尾。
+          strip_head() {
+            sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/\r//g' \
+              | tr -d '\000-\010\013\014\016-\037' | tr '\n' '|' | cut -c1-1200
+          }
+          strip_tail() {
+            sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/\r//g' \
+              | tr -d '\000-\010\013\014\016-\037' | tr '\n' '|' | tail -c 1200
+          }
           bin="./${{ matrix.bin }}"
           # 用随机高端口，避免和 runner 上其它服务撞端口
           port=$(( (RANDOM % 20000) + 30000 ))
@@ -128,16 +138,6 @@ jobs:
           "$py" scripts/e2e_test.py "$base" 2>&1 | tee "$out"
           code="${PIPESTATUS[0]}"
           if [ "$code" -ne 0 ]; then
-            # 输出带 ANSI 颜色，GitHub 会在控制字符处截断 annotation，先清干净。
-            # 结尾信息（比如 traceback）比开头重要，所以用 tail -c 取末尾。
-            strip_head() {
-              sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/\r//g' \
-                | tr -d '\000-\010\013\014\016-\037' | tr '\n' '|' | cut -c1-1200
-            }
-            strip_tail() {
-              sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/\r//g' \
-                | tr -d '\000-\010\013\014\016-\037' | tr '\n' '|' | tail -c 1200
-            }
             echo "::error::端到端测试失败 exit=$code；FAIL 项: $(grep -a 'FAIL' "$out" | strip_head)"
             echo "::error::测试输出结尾: $(strip_tail < "$out")"
             echo "::error::服务端日志结尾: $(strip_tail < "$log")"
@@ -148,3 +148,34 @@ jobs:
             echo "::error::测试通过但服务进程已退出；服务端日志: $(tail -15 "$log" | tr '\n' '|' | cut -c1-900)"
             exit 1
           fi
+
+          # 手机浏览器调用摄像头依赖 HTTPS，这里再跑一遍 TLS 模式的端到端测试
+          tls_port=$(( port + 1 ))
+          tls_log="$tmp/lan-share-tls.log"
+          tls_out="$tmp/lan-share-e2e-tls.log"
+          "$bin" --tls --port "$tls_port" --data-dir "$tmp/lan-share-tls" >"$tls_log" 2>&1 &
+          tls_pid=$!
+          trap 'kill $server_pid $tls_pid 2>/dev/null || true' EXIT
+
+          tls_ready=""
+          for _ in $(seq 1 30); do
+            if curl -fsSk "https://127.0.0.1:$tls_port/" 2>/dev/null | grep -q "局域网互传"; then
+              tls_ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [ -z "$tls_ready" ]; then
+            echo "::error::HTTPS 服务未就绪；日志: $(strip_tail < "$tls_log")"
+            exit 1
+          fi
+
+          "$py" scripts/e2e_test.py "https://127.0.0.1:$tls_port" 2>&1 | tee "$tls_out"
+          tls_code="${PIPESTATUS[0]}"
+          if [ "$tls_code" -ne 0 ]; then
+            echo "::error::HTTPS 端到端测试失败 exit=$tls_code；FAIL 项: $(grep -a 'FAIL' "$tls_out" | strip_head)"
+            echo "::error::HTTPS 输出结尾: $(strip_tail < "$tls_out")"
+            echo "::error::HTTPS 服务端日志: $(strip_tail < "$tls_log")"
+            exit "$tls_code"
+          fi
+          echo "HTTPS 模式端到端测试通过"

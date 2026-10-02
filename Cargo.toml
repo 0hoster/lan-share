@@ -1,6 +1,6 @@
 [package]
 name = "lan-share"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.75"
 description = "局域网文件互传与流媒体共享服务（第一阶段：文件传输）"
@@ -14,11 +14,13 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 axum = { version = "0.8", features = ["ws", "macros"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 dashmap = "6"
 futures-util = { version = "0.3", default-features = false }
 mime_guess = "2"
+rcgen = "0.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

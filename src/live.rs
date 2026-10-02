@@ -83,6 +83,8 @@ pub struct Chunk {
 #[derive(Clone)]
 pub enum LiveMsg {
     Chunk(Chunk),
+    /// 主播重置了流（例如切换摄像头），观众需要重新取快照
+    Reset,
     Ended,
 }
 
@@ -205,6 +207,21 @@ impl Room {
 
     pub fn subscribe(&self) -> broadcast::Receiver<LiveMsg> {
         self.sender.subscribe()
+    }
+
+    /// 切换摄像头等场景：清空快照与序号，并通知观众重新同步。
+    ///
+    /// 新的 MediaRecorder 会重新生成初始化分片，所以序号要归零。
+    pub fn reset(&self) {
+        if let Ok(mut init) = self.init.lock() {
+            *init = None;
+        }
+        if let Ok(mut tail) = self.tail.lock() {
+            tail.clear();
+        }
+        self.tail_bytes.store(0, Ordering::Relaxed);
+        self.seq.store(0, Ordering::SeqCst);
+        let _ = self.sender.send(LiveMsg::Reset);
     }
 
     /// 结束直播：通知所有观众，之后 receiver 会收到 Ended
@@ -427,6 +444,22 @@ pub struct StopResp {
     pub saved: Option<FileMeta>,
 }
 
+/// 主播重置直播流（切换摄像头等情况），观众会自动重新同步
+pub async fn reset(
+    State(state): State<Arc<AppState>>,
+    Path(room_id): Path<String>,
+    headers: HeaderMap,
+) -> ApiResult<StatusCode> {
+    let room = state
+        .live
+        .get(&room_id)
+        .ok_or_else(|| ApiError::not_found("直播不存在或已结束"))?;
+    check_key(&room, &headers)?;
+    room.reset();
+    tracing::info!("直播 {room_id} 已重置（切换采集源）");
+    Ok(StatusCode::NO_CONTENT)
+}
+
 fn check_key(room: &Room, headers: &HeaderMap) -> ApiResult<()> {
     let provided = headers
         .get("x-live-key")
@@ -535,6 +568,12 @@ async fn run_viewer(mut socket: WebSocket, room: Arc<Room>) {
                 Ok(LiveMsg::Ended) => {
                     let ended = serde_json::json!({ "type": "ended" });
                     let _ = socket.send(Message::Text(ended.to_string().into())).await;
+                    break;
+                }
+                Ok(LiveMsg::Reset) => {
+                    // 主播换了采集源，客户端需要重连拿新的初始化分片
+                    let reset = serde_json::json!({ "type": "reset" });
+                    let _ = socket.send(Message::Text(reset.to_string().into())).await;
                     break;
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {

@@ -7,6 +7,7 @@ mod live;
 mod model;
 mod net;
 mod state;
+mod tls;
 mod ws;
 
 use std::net::SocketAddr;
@@ -14,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
+use axum_server::tls_rustls::RustlsConfig;
 use clap::Parser;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -73,6 +75,18 @@ struct Cli {
     #[arg(long)]
     no_dashboard: bool,
 
+    /// 启用 HTTPS（手机浏览器调用摄像头必须；未指定端口时默认 8443）
+    #[arg(long)]
+    tls: bool,
+
+    /// 使用自有证书（需与 --tls-key 一起给，缺省则自动生成自签证书）
+    #[arg(long)]
+    tls_cert: Option<PathBuf>,
+
+    /// 使用自有私钥
+    #[arg(long)]
+    tls_key: Option<PathBuf>,
+
     /// 不打印启动横幅
     #[arg(long)]
     quiet: bool,
@@ -101,7 +115,14 @@ async fn main() -> anyhow::Result<()> {
         .host
         .or(env.host)
         .unwrap_or_else(|| "0.0.0.0".to_string());
-    let port = cli.port.or(env.port).unwrap_or(8080);
+    let tls_cert = cli.tls_cert.clone().or(env.tls_cert.clone());
+    let tls_key = cli.tls_key.clone().or(env.tls_key.clone());
+    let use_tls = cli.tls || env.tls.unwrap_or(false) || tls_cert.is_some();
+    // 启用 HTTPS 且未显式指定端口时用 8443，避免与 http 习惯端口混淆
+    let port = cli
+        .port
+        .or(env.port)
+        .unwrap_or(if use_tls { 8443 } else { 8080 });
     let data_dir = cli
         .data_dir
         .or(env.data_dir)
@@ -161,14 +182,40 @@ async fn main() -> anyhow::Result<()> {
     let addr: SocketAddr = format!("{host}:{port}")
         .parse()
         .with_context(|| format!("监听地址不合法: {host}:{port}"))?;
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("端口绑定失败: {addr}，可能已被占用"))?;
-    let local_addr = listener.local_addr()?;
+
+    // HTTPS 证书在启动阶段就准备好，配置有问题立刻报错
+    let tls_config = if use_tls {
+        let files = tls::prepare(
+            &data_dir,
+            tls_cert.as_deref(),
+            tls_key.as_deref(),
+            std::slice::from_ref(&host),
+        )?;
+        let config = RustlsConfig::from_pem_file(&files.cert, &files.key)
+            .await
+            .with_context(|| format!("加载 TLS 证书失败: {}", files.cert.display()))?;
+        Some((config, files))
+    } else {
+        None
+    };
+
+    let listener = match tls_config {
+        Some(_) => None,
+        None => Some(
+            tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("端口绑定失败: {addr}，可能已被占用"))?,
+        ),
+    };
+    let local_addr = match &listener {
+        Some(listener) => listener.local_addr()?,
+        None => addr,
+    };
 
     if !quiet {
         print_banner(BannerInfo {
             addr: local_addr,
+            tls: tls_config.is_some(),
             data_dir: &data_dir,
             chunk_size,
             token: token.as_deref(),
@@ -180,13 +227,31 @@ async fn main() -> anyhow::Result<()> {
     }
     dash.spawn();
 
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await
-    .context("HTTP 服务异常退出")?;
+    match tls_config {
+        Some((config, _files)) => {
+            let handle = axum_server::Handle::new();
+            let shutdown = handle.clone();
+            tokio::spawn(async move {
+                shutdown_signal().await;
+                shutdown.graceful_shutdown(Some(std::time::Duration::from_secs(3)));
+            });
+            axum_server::bind_rustls(local_addr, config)
+                .handle(handle)
+                .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+                .await
+                .context("HTTPS 服务异常退出")?;
+        }
+        None => {
+            let listener = listener.expect("http 监听器已创建");
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+            .context("HTTP 服务异常退出")?;
+        }
+    }
 
     tracing::info!("服务已停止");
     Ok(())
@@ -195,6 +260,8 @@ async fn main() -> anyhow::Result<()> {
 /// 启动横幅需要展示的信息（集中传参，避免函数签名过长）
 struct BannerInfo<'a> {
     addr: SocketAddr,
+    /// 是否以 HTTPS 提供服务
+    tls: bool,
     data_dir: &'a std::path::Path,
     chunk_size: u64,
     token: Option<&'a str>,
@@ -207,6 +274,7 @@ struct BannerInfo<'a> {
 fn print_banner(info: BannerInfo<'_>) {
     let BannerInfo {
         addr,
+        tls,
         data_dir,
         chunk_size,
         token,
@@ -217,15 +285,22 @@ fn print_banner(info: BannerInfo<'_>) {
     } = info;
     let token_suffix = token.map(|t| format!("?token={t}")).unwrap_or_default();
     let port = addr.port();
+    let scheme = if tls { "https" } else { "http" };
 
     println!();
     println!("  \x1b[1mlan-share\x1b[0m · 局域网文件互传");
     println!("  ─────────────────────────────────────────────");
-    println!("  本机访问    http://127.0.0.1:{port}/{token_suffix}");
+    println!("  本机访问    {scheme}://127.0.0.1:{port}/{token_suffix}");
     if let Some(ip) = net::primary_local_ip() {
-        println!("  局域网访问  \x1b[36mhttp://{ip}:{port}/{token_suffix}");
+        println!("  局域网访问  \x1b[36m{scheme}://{ip}:{port}/{token_suffix}\x1b[0m  ← 把这个地址发出去");
     } else {
-        println!("  局域网访问  http://<本机IP>:{port}/{token_suffix}");
+        println!("  局域网访问  {scheme}://<本机IP>:{port}/{token_suffix}");
+    }
+    if tls {
+        println!("  证书提示    自签证书：浏览器/手机会提示不安全，选择「继续访问」即可");
+        println!("  手机摄像头  用上面的 https 地址 → 直播录屏 → 摄像头开播");
+    } else {
+        println!("  手机摄像头  手机浏览器要求 HTTPS，加 --tls 启动即可（自动生成自签证书）");
     }
     println!("  数据目录    {}", data_dir.display());
     println!("  分片大小    {} MiB", chunk_size / 1024 / 1024);

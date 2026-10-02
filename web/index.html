@@ -109,10 +109,27 @@
           <div class="live-opts">
             <label class="field"><input type="checkbox" id="live-record" checked /> 保存录像到服务器</label>
             <label class="field"><input type="checkbox" id="live-mic" /> 同时采集麦克风</label>
+            <label class="field">画质
+              <select id="live-quality">
+                <option value="low">流畅 480p</option>
+                <option value="medium" selected>标清 720p</option>
+                <option value="high">高清 1080p</option>
+              </select>
+            </label>
+            <label class="field">镜头
+              <select id="live-facing">
+                <option value="environment">后置</option>
+                <option value="user">前置</option>
+              </select>
+            </label>
+            <label class="field">设备
+              <select id="live-device"><option value="">默认摄像头</option></select>
+            </label>
           </div>
           <div class="live-buttons">
             <button class="act primary" id="live-start-screen" type="button">共享屏幕开播</button>
             <button class="act" id="live-start-camera" type="button">摄像头开播</button>
+            <button class="act" id="live-flip" type="button" disabled>切换镜头</button>
           </div>
         </div>
         <div id="live-self" hidden>
