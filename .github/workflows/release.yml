@@ -75,9 +75,14 @@ jobs:
       - name: 启动服务并跑端到端测试
         shell: bash
         run: |
+          # GitHub 会给 bash 步骤隐式加上 -e（bash -eo pipefail），必须显式关掉，
+          # 否则测试一旦非零退出，步骤会立刻结束，下面的诊断输出全部丢失。
+          set +e
           set -uo pipefail
           bin="./${{ matrix.bin }}"
-          base="http://127.0.0.1:18080"
+          # 用随机高端口，避免和 runner 上其它服务撞端口
+          port=$(( (RANDOM % 20000) + 30000 ))
+          base="http://127.0.0.1:$port"
           tmp="${RUNNER_TEMP:-/tmp}"
           log="$tmp/lan-share-server.log"
           out="$tmp/lan-share-e2e.log"
@@ -86,17 +91,18 @@ jobs:
           mkdir -p "$tmp"
           ls -l "$bin" || { echo "::error::找不到可执行文件 $bin"; exit 1; }
 
-          "$bin" --port 18080 --data-dir "$tmp/lan-share-data" >"$log" 2>&1 &
+          "$bin" --port "$port" --data-dir "$tmp/lan-share-data" >"$log" 2>&1 &
           server_pid=$!
           trap 'kill $server_pid 2>/dev/null || true' EXIT
 
           ready=""
           for _ in $(seq 1 30); do
-            if curl -fsS "$base/" >/dev/null 2>&1; then ready=1; break; fi
+            # 必须确认响应的确是本服务的页面，而不是恰好占用该端口的其它服务
+            if curl -fsS "$base/" 2>/dev/null | grep -q "局域网互传"; then ready=1; break; fi
             sleep 1
           done
           if [ -z "$ready" ]; then
-            echo "::error::服务 30 秒内未就绪；服务端日志: $(tail -12 "$log" | tr '\n' '|' | cut -c1-1000)"
+            echo "::error::服务 30 秒内未就绪（端口 $port）；服务端日志: $(tail -12 "$log" | tr '\n' '|' | cut -c1-1000)"
             exit 1
           fi
           echo "服务已就绪"
@@ -118,6 +124,13 @@ jobs:
           "$py" scripts/e2e_test.py "$base" 2>&1 | tee "$out"
           code="${PIPESTATUS[0]}"
           if [ "$code" -ne 0 ]; then
-            echo "::error::端到端测试失败 exit=$code；末尾输出: $(tail -12 "$out" | tr '\n' '|' | cut -c1-1200)"
+            echo "::error::端到端测试失败 exit=$code；输出开头: $(head -25 "$out" | tr '\n' '|' | cut -c1-1400)"
+            echo "::error::测试输出末尾: $(tail -20 "$out" | tr '\n' '|' | cut -c1-1400)"
+            echo "::error::服务端日志: $(tail -15 "$log" | tr '\n' '|' | cut -c1-900)"
             exit "$code"
+          fi
+
+          if ! kill -0 "$server_pid" 2>/dev/null; then
+            echo "::error::测试通过但服务进程已退出；服务端日志: $(tail -15 "$log" | tr '\n' '|' | cut -c1-900)"
+            exit 1
           fi
