@@ -87,6 +87,7 @@ jobs:
           log="$tmp/lan-share-server.log"
           out="$tmp/lan-share-e2e.log"
 
+          echo "::notice::[1] bash=${BASH_VERSION:-?} bin=$bin port=$port tmp=$tmp"
           echo "binary  : $bin"
           mkdir -p "$tmp"
           ls -l "$bin" || { echo "::error::找不到可执行文件 $bin"; exit 1; }
@@ -106,6 +107,7 @@ jobs:
             exit 1
           fi
           echo "服务已就绪"
+          echo "::notice::[2] server ready on $port"
 
           # 逐个尝试并真实执行一遍，避免命中 Windows 应用商店占位程序
           py=""
@@ -120,6 +122,7 @@ jobs:
             exit 1
           fi
           echo "python  : $py ($("$py" -V 2>&1))"
+          echo "::notice::[3] python=$py"
 
           "$py" scripts/e2e_test.py "$base" 2>&1 | tee "$out"
           code="${PIPESTATUS[0]}"
@@ -134,3 +137,4 @@ jobs:
             echo "::error::测试通过但服务进程已退出；服务端日志: $(tail -15 "$log" | tr '\n' '|' | cut -c1-900)"
             exit 1
           fi
+          echo "::notice::[4] e2e passed"
