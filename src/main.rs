@@ -130,9 +130,7 @@ fn print_banner(
     println!("  ─────────────────────────────────────────────");
     println!("  本机访问    http://127.0.0.1:{port}/{token_suffix}");
     if let Some(ip) = net::primary_local_ip() {
-        println!(
-            "  局域网访问  \x1b[36mhttp://{ip}:{port}/{token_suffix}"
-        );
+        println!("  局域网访问  \x1b[36mhttp://{ip}:{port}/{token_suffix}");
     } else {
         println!("  局域网访问  http://<本机IP>:{port}/{token_suffix}");
     }

@@ -42,6 +42,11 @@ def url(path):
     return f"{BASE}{path}{sep}token={TOKEN}"
 
 
+def normalize_headers(message):
+    """HTTP 头大小写不敏感，hyper 发出的就是全小写，统一规范化后再断言。"""
+    return {key.lower(): value for key, value in message.items()}
+
+
 def request(path, method="GET", data=None, headers=None):
     req = urllib.request.Request(url(path), data=data, method=method)
     if TOKEN:
@@ -50,9 +55,9 @@ def request(path, method="GET", data=None, headers=None):
         req.add_header(key, value)
     try:
         with urllib.request.urlopen(req, timeout=90) as resp:
-            return resp.status, dict(resp.headers), resp.read()
+            return resp.status, normalize_headers(resp.headers), resp.read()
     except urllib.error.HTTPError as err:
-        return err.code, dict(err.headers), err.read()
+        return err.code, normalize_headers(err.headers), err.read()
 
 
 def json_request(path, method="GET", payload=None):
@@ -96,7 +101,7 @@ def download_parallel(file_id, total, concurrency=PARALLEL, chunk=512 * 1024):
         )
         assert status == 206, f"range failed: {status}"
         expected = f"bytes {start}-{end}/{total}"
-        assert headers.get("Content-Range") == expected, headers.get("Content-Range")
+        assert headers.get("content-range") == expected, headers.get("content-range")
         return index, body
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
@@ -108,7 +113,7 @@ def download_parallel(file_id, total, concurrency=PARALLEL, chunk=512 * 1024):
 def test_static():
     status, headers, body = request("/")
     check("home page returns 200", status == 200, status)
-    check("home page is html", "text/html" in headers.get("Content-Type", ""))
+    check("home page is html", "text/html" in headers.get("content-type", ""))
     check("home page renders Chinese title", "局域网互传" in body.decode("utf-8", "ignore"))
     status, _, body = request("/app.js")
     check("app.js is served", status == 200 and b"uploadChunk" in body, status)
@@ -168,9 +173,9 @@ def test_upload_download():
     check("file appears in listing", status == 200 and any(f["id"] == file_id for f in files))
 
     status, headers, _ = request(f"/api/files/{file_id}/download", method="HEAD")
-    check("HEAD reports size", status == 200 and headers.get("Content-Length") == str(len(payload)))
-    check("Accept-Ranges advertised", headers.get("Accept-Ranges") == "bytes")
-    check("UTF-8 filename in header", "filename*=UTF-8''" in headers.get("Content-Disposition", ""))
+    check("HEAD reports size", status == 200 and headers.get("content-length") == str(len(payload)))
+    check("Accept-Ranges advertised", headers.get("accept-ranges") == "bytes")
+    check("UTF-8 filename in header", "filename*=UTF-8''" in headers.get("content-disposition", ""))
 
     status, _, body = request(f"/api/files/{file_id}/download")
     check("full download matches", hashlib.sha256(body).hexdigest() == digest, len(body))
