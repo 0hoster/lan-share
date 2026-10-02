@@ -20,6 +20,7 @@ use uuid::Uuid;
 
 use crate::assets;
 use crate::error::{ApiError, ApiResult};
+use crate::live;
 use crate::model::{Event, FileMeta, InitUploadReq, InitUploadResp, Stats, UploadStatus};
 use crate::state::{now_secs, record_received, AppState, UploadSession};
 use crate::ws;
@@ -40,6 +41,12 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/upload/{id}/complete", post(complete_upload))
         .route("/upload/{id}", delete(abort_upload))
         .route("/stats", get(stats))
+        // ---- 直播 / 录屏 ----
+        .route("/live/rooms", get(live::list_rooms))
+        .route("/live/start", post(live::start))
+        .route("/live/{id}/chunk", put(live::push_chunk))
+        .route("/live/{id}/stop", post(live::stop))
+        .route("/live/{id}/ws", get(live::viewer))
         // 分片上传：单个请求体最大约 64 MiB，足够覆盖默认分片大小
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .layer(axum::middleware::from_fn_with_state(
@@ -47,13 +54,23 @@ pub fn router(state: Arc<AppState>) -> Router {
             auth_middleware,
         ));
 
+    // 事件流同样可能泄露文件名，开启令牌时必须一起鉴权
+    let events =
+        Router::new()
+            .route("/ws", get(ws::handler))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ));
+
     Router::new()
         .route("/", get(index))
         .route("/index.html", get(index))
         .route("/app.js", get(app_js))
+        .route("/live.js", get(live_js))
         .route("/styles.css", get(styles_css))
         .route("/favicon.ico", get(favicon))
-        .route("/ws", get(ws::handler))
+        .merge(events)
         .nest("/api", api)
         .with_state(state)
 }
@@ -74,6 +91,16 @@ async fn app_js() -> impl IntoResponse {
             "application/javascript; charset=utf-8",
         )],
         assets::APP_JS,
+    )
+}
+
+async fn live_js() -> impl IntoResponse {
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        assets::LIVE_JS,
     )
 }
 
@@ -204,6 +231,7 @@ async fn stats(State(state): State<Arc<AppState>>) -> ApiResult<Json<Stats>> {
         files: state.files.len(),
         bytes: state.total_bytes(),
         uploads: state.sessions.len(),
+        live: state.live.len(),
         uptime_secs: state.started.elapsed().as_secs(),
         chunk_size: state.chunk_size,
     }))

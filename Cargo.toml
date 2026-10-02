@@ -1,6 +1,6 @@
 [package]
 name = "lan-share"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75"
 description = "局域网文件互传与流媒体共享服务（第一阶段：文件传输）"

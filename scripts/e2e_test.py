@@ -13,6 +13,8 @@ import json
 import os
 import socket
 import sys
+import base64
+import struct
 import urllib.error
 import urllib.request
 from urllib.parse import urlparse
@@ -20,6 +22,14 @@ from urllib.parse import urlparse
 BASE = (sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:18080").rstrip("/")
 TOKEN = sys.argv[2] if len(sys.argv) > 2 else ""
 PARALLEL = 4
+
+# Windows 上 Python 默认用 cp1252 输出，打印中文检查名会直接抛
+# UnicodeEncodeError 把测试打死，这里强制 UTF-8。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
 
 passed = 0
 failed = []
@@ -60,10 +70,12 @@ def request(path, method="GET", data=None, headers=None):
         return err.code, normalize_headers(err.headers), err.read()
 
 
-def json_request(path, method="GET", payload=None):
+def json_request(path, method="GET", payload=None, headers=None):
     data = json.dumps(payload).encode() if payload is not None else None
-    headers = {"Content-Type": "application/json"} if payload is not None else None
-    status, resp_headers, body = request(path, method=method, data=data, headers=headers)
+    extra = dict(headers or {})
+    if payload is not None:
+        extra["Content-Type"] = "application/json"
+    status, resp_headers, body = request(path, method=method, data=data, headers=extra)
     parsed = json.loads(body) if body else None
     return status, resp_headers, parsed
 
@@ -130,36 +142,243 @@ def test_auth_required():
         status = err.code
     check("api without token returns 401", status == 401, status)
 
+    # 事件流同样要有鉴权，否则文件增删事件会泄露给局域网里任何人
+    try:
+        client = WsClient("/ws", send_token=False)
+        check("websocket without token is rejected", "101" not in client.status_line, client.status_line)
+        client.close()
+    except OSError as err:
+        check("websocket without token is rejected", False, err)
+
+    try:
+        client = WsClient("/ws")
+        check("websocket with token is accepted", "101" in client.status_line, client.status_line)
+        client.close()
+    except OSError as err:
+        check("websocket with token is accepted", False, err)
+
+
+class WsClient:
+    """够用的 WebSocket 客户端：文本 + 二进制帧，用于验证实时转发。"""
+
+    def __init__(self, path, timeout=15, send_token=True):
+        parsed = urlparse(BASE)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or 80
+        if TOKEN and send_token:
+            path += ("&" if "?" in path else "?") + "token=" + TOKEN
+        self.sock = socket.create_connection((host, port), timeout=timeout)
+        self.buf = b""
+        key = base64.b64encode(os.urandom(16)).decode()
+        handshake = (
+            f"GET {path} HTTP/1.1\r\n"
+            f"Host: {host}:{port}\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        )
+        self.sock.sendall(handshake.encode())
+        head = b""
+        while b"\r\n\r\n" not in head:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise RuntimeError("websocket 握手失败")
+            head += chunk
+        self.status_line = head.split(b"\r\n")[0].decode("latin1")
+        self.buf = head.split(b"\r\n\r\n", 1)[1]
+
+    def _read(self, size):
+        while len(self.buf) < size:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise RuntimeError("连接已关闭")
+            self.buf += chunk
+        data, self.buf = self.buf[:size], self.buf[size:]
+        return data
+
+    def recv_frame(self):
+        """返回 (opcode, payload)；仅处理服务端发来的未掩码帧。"""
+        first, second = self._read(2)
+        opcode = first & 0x0F
+        length = second & 0x7F
+        if length == 126:
+            length = struct.unpack(">H", self._read(2))[0]
+        elif length == 127:
+            length = struct.unpack(">Q", self._read(8))[0]
+        if second & 0x80:
+            mask = self._read(4)
+            payload = bytes(b ^ mask[i % 4] for i, b in enumerate(self._read(length)))
+        else:
+            payload = self._read(length)
+        return opcode, payload
+
+    def recv_text(self):
+        while True:
+            opcode, payload = self.recv_frame()
+            if opcode == 0x1:
+                return payload.decode("utf-8", "ignore")
+            if opcode == 0x8:
+                raise RuntimeError("连接被关闭")
+
+    def recv_binary(self):
+        while True:
+            opcode, payload = self.recv_frame()
+            if opcode == 0x2:
+                return payload
+            if opcode == 0x8:
+                raise RuntimeError("连接被关闭")
+
+    def close(self):
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
 
 def test_websocket():
-    parsed = urlparse(BASE)
-    host = parsed.hostname or "127.0.0.1"
-    port = parsed.port or 80
-    path = "/ws" + (f"?token={TOKEN}" if TOKEN else "")
-    key = base64_key()
     try:
-        conn = socket.create_connection((host, port), timeout=15)
+        client = WsClient("/ws")
     except OSError as err:
         check("websocket upgrade succeeds", False, err)
         return
-    handshake = (
-        f"GET {path} HTTP/1.1\r\n"
-        f"Host: {host}:{port}\r\n"
-        "Upgrade: websocket\r\n"
-        "Connection: Upgrade\r\n"
-        f"Sec-WebSocket-Key: {key}\r\n"
-        "Sec-WebSocket-Version: 13\r\n\r\n"
+    check("websocket upgrade succeeds", "101" in client.status_line, client.status_line)
+    client.close()
+
+
+def test_live_relay():
+    """直播链路：推流密钥、房间列表、中途加入的快照、实时转发、结束与录像。"""
+    mime = "video/webm;codecs=vp8,opus"
+    status, _, start = json_request(
+        "/api/live/start", "POST", {"title": "自动化测试直播", "mime": mime, "record": True}
     )
-    conn.sendall(handshake.encode())
-    head = conn.recv(2048).decode("latin1")
-    conn.close()
-    status_line = head.split("\r\n")[0]
-    check("websocket upgrade succeeds", "101" in status_line, status_line)
+    check("live: 创建直播间成功", status == 200 and start.get("room_id"), start)
+    if status != 200:
+        return
+    room_id, key = start["room_id"], start["key"]
+
+    status, _, rooms = json_request("/api/live/rooms")
+    room = next((r for r in rooms if r["id"] == room_id), None)
+    check("live: 房间出现在列表中", room is not None, rooms)
+    check("live: 房间记录了编码格式", room and room["mime"] == mime, room)
+    check("live: 标记了正在录像", room and room["recording"] is True, room)
+
+    status, _, _ = request(
+        f"/api/live/{room_id}/chunk", "PUT", b"x" * 64, headers={"x-live-key": "wrong-key"}
+    )
+    check("live: 错误密钥被拒绝", status == 403, status)
+
+    # 第一个分片当作 WebM 初始化段，其后是媒体分片
+    init_segment = b"\x1a\x45\xdf\xa3" + b"init-segment" * 8
+    chunks = [init_segment] + [bytes([i]) * 512 for i in range(1, 5)]
+    for index, chunk in enumerate(chunks):
+        status, _, _ = request(
+            f"/api/live/{room_id}/chunk", "PUT", chunk, headers={"x-live-key": key}
+        )
+        assert status == 200, f"推流分片 {index} 失败: {status}"
+    check("live: 连续推流 5 个分片", True)
+
+    # 中途加入的观众应当拿到 info + 初始化分片 + 最近分片
+    viewer = WsClient(f"/api/live/{room_id}/ws")
+    info = json.loads(viewer.recv_text())
+    check("live: 观众收到房间信息", info.get("type") == "info" and info["room"]["id"] == room_id, info)
+    first = viewer.recv_binary()
+    check("live: 新观众先拿到初始化分片", first == init_segment, len(first))
+    tail = [viewer.recv_binary() for _ in range(4)]
+    check("live: 新观众补齐最近分片", tail == chunks[1:], [len(t) for t in tail])
+
+    # 实时转发
+    live_chunk = b"\x00live-tail-chunk"
+    request(f"/api/live/{room_id}/chunk", "PUT", live_chunk, headers={"x-live-key": key})
+    pushed = viewer.recv_binary()
+    check("live: 新分片实时转发给观众", pushed == live_chunk, len(pushed))
+
+    # 结束直播并校验录像
+    status, _, stop = json_request(f"/api/live/{room_id}/stop", "POST", headers={"x-live-key": key})
+    check("live: 结束直播成功", status == 200, f"{status} {stop}")
+    saved = stop.get("saved") if stop else None
+    expected_size = sum(len(c) for c in chunks) + len(live_chunk)
+    check("live: 生成了录像文件", bool(saved) and saved["size"] == expected_size, saved)
+    check("live: 录像 MIME 正确", saved and saved["mime"] == "video/webm", saved)
+    check("live: 录像文件名带时间戳", saved and saved["name"].startswith("录屏-自动化测试直播-"), saved)
+
+    status, _, files = json_request("/api/files")
+    check("live: 录像进入文件列表", any(f["id"] == saved["id"] for f in files), files)
+    if saved:
+        status, _, body = request(f"/api/files/{saved['id']}/download")
+        check(
+            "live: 录像内容与推流数据一致",
+            body == b"".join(chunks) + live_chunk,
+            len(body),
+        )
+        request(f"/api/files/{saved['id']}", "DELETE")
+
+    status, _, rooms = json_request("/api/live/rooms")
+    check("live: 结束后房间消失", all(r["id"] != room_id for r in rooms), rooms)
+    try:
+        viewer.close()
+    except OSError:
+        pass
 
 
-def base64_key():
-    import base64
-    return base64.b64encode(os.urandom(16)).decode()
+def test_live_viewer_joins_before_first_chunk():
+    """开播瞬间（房间已出现但还没有任何分片）就加入的观众，必须拿到初始化分片。"""
+    status, _, start = json_request(
+        "/api/live/start", "POST", {"title": "空房间边界", "mime": "video/webm", "record": False}
+    )
+    assert status == 200, start
+    room_id, key = start["room_id"], start["key"]
+
+    viewer = WsClient(f"/api/live/{room_id}/ws")
+    info = json.loads(viewer.recv_text())
+    check("live: 空房间也能加入并收到 info", info.get("type") == "info", info)
+
+    init_segment = b"\x1a\x45\xdf\xa3INIT-ON-EMPTY-ROOM"
+    request(f"/api/live/{room_id}/chunk", "PUT", init_segment, headers={"x-live-key": key})
+    request(f"/api/live/{room_id}/chunk", "PUT", b"chunk-after-init", headers={"x-live-key": key})
+
+    first = viewer.recv_binary()
+    check("live: 开播瞬间加入的观众能拿到初始化分片", first == init_segment, len(first))
+    second = viewer.recv_binary()
+    check("live: 初始化分片之后的分片接续正确", second == b"chunk-after-init", len(second))
+
+    json_request(f"/api/live/{room_id}/stop", "POST", headers={"x-live-key": key})
+    ended = json.loads(viewer.recv_text())
+    check("live: 主播结束后观众收到 ended", ended.get("type") == "ended", ended)
+    viewer.close()
+
+
+def test_live_tail_ring_buffer():
+    """长时间直播后新加入的观众：保留初始化分片、只补最近一段、不能有重复。"""
+    status, _, start = json_request(
+        "/api/live/start", "POST", {"title": "尾部缓冲边界", "mime": "video/webm", "record": False}
+    )
+    assert status == 200, start
+    room_id, key = start["room_id"], start["key"]
+
+    init_segment = b"\x1a\x45\xdf\xa3RING-INIT"
+    request(f"/api/live/{room_id}/chunk", "PUT", init_segment, headers={"x-live-key": key})
+    # 24 MiB 是服务端保留的尾部预算，这里推 26 MiB 触发裁剪
+    payload = bytes(range(256)) * (1024 * 4)  # 1 MiB
+    for _ in range(26):
+        request(f"/api/live/{room_id}/chunk", "PUT", payload, headers={"x-live-key": key})
+
+    viewer = WsClient(f"/api/live/{room_id}/ws")
+    json.loads(viewer.recv_text())
+    received = [viewer.recv_binary()]
+    viewer.sock.settimeout(2)
+    try:
+        while True:
+            received.append(viewer.recv_binary())
+    except (TimeoutError, OSError):
+        pass
+
+    check("live: 裁剪后仍保留初始化分片", received[0] == init_segment, len(received[0]))
+    check("live: 只补齐最近的尾部而非全量", 2 <= len(received) <= 26, len(received))
+    check("live: 分片内容为 1MiB 的媒体分片", all(len(c) == len(payload) for c in received[1:]))
+
+    json_request(f"/api/live/{room_id}/stop", "POST", headers={"x-live-key": key})
+    viewer.close()
 
 
 def test_upload_download():
@@ -266,6 +485,9 @@ def main():
     test_websocket()
     file_id = test_upload_download()
     empty_id = test_edge_cases()
+    test_live_relay()
+    test_live_viewer_joins_before_first_chunk()
+    test_live_tail_ring_buffer()
     test_delete(file_id, empty_id)
 
     print()

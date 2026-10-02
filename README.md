@@ -1,8 +1,6 @@
-# lan-share · 局域网文件互传
+# lan-share · 局域网文件互传 + 直播录屏
 
-一个用 Rust 写的局域网文件传输服务：在一台设备上启动程序，同一 WiFi / 局域网内的其他设备用浏览器打开地址，即可互相上传、下载文件。前端资源编译进二进制，单文件即可运行，支持 **Windows / macOS / Linux**。
-
-第一阶段（本版本）实现文件传输；视频流共享已在架构上预留（见路线图）。
+一个用 Rust 写的局域网互传服务：在一台设备上启动程序，同一 WiFi / 局域网内的其他设备用浏览器打开地址，即可互相上传、下载文件，也可以**把屏幕或摄像头实时直播给其他人看**。前端资源编译进二进制，单文件即可运行，支持 **Windows / macOS / Linux**。
 
 ## 特性
 
@@ -13,7 +11,8 @@
 - **实时协同**：WebSocket 广播文件增删事件，多个浏览器之间自动同步列表。
 - **简洁 Web UI**：拖拽上传、进度/速度/剩余时间、搜索、直链复制，自适应深色模式与手机屏幕。
 - **可选访问令牌**：`--token` 开启后，接口与 WebSocket 都要求携带令牌。
-- **单文件部署**：`cargo build --release` 产物约 2.9 MB，无运行时依赖。
+- **直播录屏**（v0.2）：浏览器共享屏幕/摄像头即可开播，其他人点开就能看；服务端可同时把直播录成 WebM 文件，结束后自动出现在共享文件列表里。
+- **单文件部署**：`cargo build --release` 产物约 3 MB，无运行时依赖。
 
 ## 快速开始
 
@@ -126,6 +125,21 @@ DIST=... CROSS_ROOT=/opt/toolchain ./scripts/build-cross.sh
 
 > 浏览器单文件并行下载需要把数据在内存中重组，因此超过 1.5 GB 会自动回退为浏览器原生下载（同样支持断点续传）。
 
+## 直播录屏
+
+切到页面顶部的「直播录屏」标签即可使用：
+
+1. **开播**：填写标题（可选），选择是否把录像保存到服务器，点「共享屏幕开播」或「摄像头开播」，在浏览器弹窗里选中要共享的屏幕 / 窗口 / 标签页。勾选「同时采集麦克风」可以把麦克风与系统声音混在一起推出去。
+2. **观看**：任何人打开同一个地址，在「正在直播」列表里点「观看」即可，延迟通常在 1~3 秒。播放器下方会显示已直播时长、落后直播点的秒数、已接收的数据量和观看人数。
+3. **结束**：点「结束直播」（或直接在浏览器自带的共享提示条上点「停止共享」）。如果勾选了保存录像，服务端会把整段直播写成 `录屏-<标题>-<时间>.webm` 放进共享文件列表，其他人可以直接下载或在线预览。
+
+几点说明：
+
+- 直播走的是 **WebSocket + MediaSource**，不需要额外安装插件，也不需要 WebRTC 信令服务器；代价是延迟比 WebRTC 高一些（分片间隔 1 秒，实测端到端约 1~3 秒）。
+- 采集需要 HTTPS 或 localhost 这两个安全上下文。局域网里用 `http://192.168.x.x:8080` 打开时，Chrome 仍然允许共享屏幕（getDisplayMedia 在局域网 IP 上可用），但如果浏览器拒绝，可以改用 `localhost` 或给服务套一层 HTTPS 反代。
+- 观看端依赖 MSE 播放 WebM：Chrome / Edge / Firefox 支持，**Safari 目前无法直接观看**（可以下载录像文件，Safari 能播 WebM 文件）。用 Chrome/Edge 观看体验最好。
+- 同一时间最多 8 路直播、每路最多 32 个观众；主播掉线（90 秒没有新数据）会被自动结束并保存已录部分。
+
 ## 工作原理
 
 ```
@@ -138,6 +152,16 @@ DIST=... CROSS_ROOT=/opt/toolchain ./scripts/build-cross.sh
   │ ⑤ GET  .../download  (Range)   ────►  206 Partial Content，多路并发拉取
   │
   │ ⑥ WS   /ws                        ◄── 文件增删事件广播（实时同步列表）
+
+直播链路（v0.2）：
+
+  │ ① POST /api/live/start          ──►  建房间，返回房间号与主播密钥
+  │ ② PUT  /api/live/{id}/chunk     ──►  MediaRecorder 每秒一片，顺序推送
+  │                                      服务端：留存首个「初始化分片」+ 最近分片环缓冲
+  │                                              （可选）同时写录像文件
+  │ ③ WS   /api/live/{id}/ws        ◄──  观众先收 info + 初始化分片 + 最近分片，
+  │                                      之后实时收新分片，交给 MediaSource 播放
+  │ ④ POST /api/live/{id}/stop      ──►  结束直播，录像转正并进入文件列表
 ```
 
 数据目录结构：
@@ -146,7 +170,7 @@ DIST=... CROSS_ROOT=/opt/toolchain ./scripts/build-cross.sh
 lan-share-data/
 ├── files/   已完成文件（<uuid>__<原始文件名>，方便直接到目录里取用）
 ├── meta/    每个文件一份 JSON 元数据，启动时用于恢复索引
-└── tmp/     上传中的临时文件，异常退出后启动时自动清理
+└── tmp/     上传中的临时文件与直播录像中间文件，异常退出后启动时自动清理
 ```
 
 ### HTTP API
@@ -164,6 +188,11 @@ lan-share-data/
 | `GET` | `/api/upload` | 进行中的上传及其已收分片 |
 | `GET` | `/api/stats` | 文件数、总字节数、运行时长 |
 | `GET` | `/ws` | WebSocket 事件流 |
+| `GET` | `/api/live/rooms` | 正在进行的直播列表 |
+| `POST` | `/api/live/start` | 开播：`{title, mime, record}` → `{room_id, key}` |
+| `PUT` | `/api/live/{id}/chunk` | 主播推送分片（裸字节，需 `x-live-key` 头） |
+| `POST` | `/api/live/{id}/stop` | 结束直播；开启录制时返回生成的录像文件 |
+| `GET` | `/api/live/{id}/ws` | 观众连接：先收一条 `info` 文本，随后是二进制分片 |
 
 开启令牌后，上述接口都需要 `?token=xxx` 或 `Authorization: Bearer xxx`；静态页面本身不鉴权，令牌通过 URL 传入后会保存在浏览器 localStorage 中。
 
@@ -200,13 +229,14 @@ cargo run --release -- --token mySecret   # 指定令牌
 ## 测试
 
 ```bash
-# 端到端接口测试（32 项：上传/下载/Range/416/乱序分片/删除/鉴权/WebSocket）
+# 端到端接口测试（56 项：上传/下载/Range/416/乱序分片/删除/鉴权/WebSocket/直播推流与录像；
+# 带 --token 时另有 3 项鉴权用例）
 python3 scripts/e2e_test.py http://127.0.0.1:8080
 
 # 吞吐量基准
 python3 scripts/bench.py http://127.0.0.1:8080 256
 
-# 真实浏览器测试（无头 Chrome 模拟拖拽上传 + 并行下载，可输出截图）
+# 真实浏览器测试（无头 Chrome：拖拽上传、并行下载、真实 MediaRecorder 开播 + MSE 观看）
 python3 scripts/browser_test.py http://127.0.0.1:8080 /tmp/ui.png
 
 # 代码检查
@@ -215,9 +245,9 @@ cargo clippy --all-targets && cargo fmt --check
 
 ## 路线图
 
-- **v1（当前）** 文件互传：并行分片上传、Range 并行下载、实时列表同步。
-- **v2** 视频流共享（类直播）：浏览器 `getUserMedia` 采集 → WebRTC / WebSocket 分发 → 其他设备用 `<video>` 播放；对不支持 WebRTC 的场景提供 fMP4 分片 + `MediaSource` 的降级方案。
-- **v3** 体验增强：上传断点自动续传（刷新页面后继续）、多文件打包下载、扫码访问、目录级分享。
+- **v0.1** 文件互传：并行分片上传、Range 并行下载、实时列表同步。
+- **v0.2（当前）** 直播录屏：屏幕/摄像头开播、WebSocket + MediaSource 转发、服务端视频录像。
+- **v0.3** 体验增强：上传断点自动续传（刷新页面后继续）、多文件打包下载、扫码访问、直播画质/码率选择、WebRTC 低延迟模式。
 
 ## 许可
 

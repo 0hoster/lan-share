@@ -74,6 +74,10 @@ jobs:
 
       - name: 启动服务并跑端到端测试
         shell: bash
+        env:
+          # Windows runner 默认 cp1252，中文输出会让测试脚本抛 UnicodeEncodeError
+          PYTHONIOENCODING: utf-8
+          PYTHONUTF8: "1"
         run: |
           # GitHub 会给 bash 步骤隐式加上 -e（bash -eo pipefail），必须显式关掉，
           # 否则测试一旦非零退出，步骤会立刻结束，下面的诊断输出全部丢失。
@@ -124,9 +128,19 @@ jobs:
           "$py" scripts/e2e_test.py "$base" 2>&1 | tee "$out"
           code="${PIPESTATUS[0]}"
           if [ "$code" -ne 0 ]; then
-            echo "::error::端到端测试失败 exit=$code；输出开头: $(head -25 "$out" | tr '\n' '|' | cut -c1-1400)"
-            echo "::error::测试输出末尾: $(tail -20 "$out" | tr '\n' '|' | cut -c1-1400)"
-            echo "::error::服务端日志: $(tail -15 "$log" | tr '\n' '|' | cut -c1-900)"
+            # 输出带 ANSI 颜色，GitHub 会在控制字符处截断 annotation，先清干净。
+            # 结尾信息（比如 traceback）比开头重要，所以用 tail -c 取末尾。
+            strip_head() {
+              sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/\r//g' \
+                | tr -d '\000-\010\013\014\016-\037' | tr '\n' '|' | cut -c1-1200
+            }
+            strip_tail() {
+              sed -e 's/\x1b\[[0-9;]*[a-zA-Z]//g' -e 's/\r//g' \
+                | tr -d '\000-\010\013\014\016-\037' | tr '\n' '|' | tail -c 1200
+            }
+            echo "::error::端到端测试失败 exit=$code；FAIL 项: $(grep -a 'FAIL' "$out" | strip_head)"
+            echo "::error::测试输出结尾: $(strip_tail < "$out")"
+            echo "::error::服务端日志结尾: $(strip_tail < "$log")"
             exit "$code"
           fi
 

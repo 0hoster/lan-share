@@ -8,6 +8,7 @@ use dashmap::DashMap;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
+use crate::live::LiveHub;
 use crate::model::{Event, FileMeta};
 
 /// 一次上传会话（对应一个分片上传中的文件）。
@@ -59,6 +60,8 @@ pub struct AppState {
     pub sessions: DashMap<Uuid, UploadSession>,
     pub files: DashMap<Uuid, FileMeta>,
     pub events: broadcast::Sender<Event>,
+    /// 正在进行的直播房间
+    pub live: LiveHub,
     pub token: Option<String>,
     pub started: Instant,
 }
@@ -88,6 +91,7 @@ impl AppState {
             sessions: DashMap::new(),
             files: DashMap::new(),
             events,
+            live: LiveHub::new(),
             token,
             started: Instant::now(),
         };
