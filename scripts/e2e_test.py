@@ -22,6 +22,14 @@ from urllib.parse import urlparse
 BASE = (sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:18080").rstrip("/")
 TOKEN = sys.argv[2] if len(sys.argv) > 2 else ""
 PARALLEL = 4
+IS_TLS = BASE.startswith("https://")
+
+# 测试自签证书时忽略校验（仅测试脚本使用，服务端行为不变）
+SSL_CTX = None
+if IS_TLS:
+    import ssl
+
+    SSL_CTX = ssl._create_unverified_context()
 
 # Windows 上 Python 默认用 cp1252 输出，打印中文检查名会直接抛
 # UnicodeEncodeError 把测试打死，这里强制 UTF-8。
@@ -64,7 +72,7 @@ def request(path, method="GET", data=None, headers=None):
     for key, value in (headers or {}).items():
         req.add_header(key, value)
     try:
-        with urllib.request.urlopen(req, timeout=90) as resp:
+        with urllib.request.urlopen(req, timeout=90, context=SSL_CTX) as resp:
             return resp.status, normalize_headers(resp.headers), resp.read()
     except urllib.error.HTTPError as err:
         return err.code, normalize_headers(err.headers), err.read()
@@ -168,6 +176,8 @@ class WsClient:
         if TOKEN and send_token:
             path += ("&" if "?" in path else "?") + "token=" + TOKEN
         self.sock = socket.create_connection((host, port), timeout=timeout)
+        if IS_TLS:
+            self.sock = SSL_CTX.wrap_socket(self.sock, server_hostname=host)
         self.buf = b""
         key = base64.b64encode(os.urandom(16)).decode()
         handshake = (
@@ -381,6 +391,39 @@ def test_live_tail_ring_buffer():
     viewer.close()
 
 
+def test_live_reset_for_camera_switch():
+    """切换摄像头会重建 MediaRecorder：服务端要清空快照并通知老观众重新同步。"""
+    status, _, start = json_request(
+        "/api/live/start", "POST", {"title": "切换镜头", "mime": "video/webm", "record": False}
+    )
+    assert status == 200, start
+    room_id, key = start["room_id"], start["key"]
+
+    viewer = WsClient(f"/api/live/{room_id}/ws")
+    json.loads(viewer.recv_text())
+    request(f"/api/live/{room_id}/chunk", "PUT", b"\x1a\x45\xdf\xa3OLD-INIT", headers={"x-live-key": key})
+    check("live: 重置前观众能收到画面分片", viewer.recv_binary() == b"\x1a\x45\xdf\xa3OLD-INIT")
+
+    status, _, _ = request(f"/api/live/{room_id}/reset", "POST", b"", headers={"x-live-key": key})
+    check("live: 重置直播流成功", status == 204, status)
+    check("live: 老观众收到 reset 通知", json.loads(viewer.recv_text()).get("type") == "reset")
+    viewer.close()
+
+    # 新的初始化分片必须能被新观众拿到（序号已归零）
+    new_init = b"\x1a\x45\xdf\xa3NEW-INIT"
+    request(f"/api/live/{room_id}/chunk", "PUT", new_init, headers={"x-live-key": key})
+    request(f"/api/live/{room_id}/chunk", "PUT", b"NEW-CHUNK", headers={"x-live-key": key})
+    late = WsClient(f"/api/live/{room_id}/ws")
+    json.loads(late.recv_text())
+    check("live: 重置后新观众拿到新的初始化分片", late.recv_binary() == new_init)
+    check("live: 重置后分片接续正常", late.recv_binary() == b"NEW-CHUNK")
+    late.close()
+
+    status, _, _ = request(f"/api/live/{room_id}/reset", "POST", b"", headers={"x-live-key": "bad"})
+    check("live: 重置也需要主播密钥", status == 403, status)
+    json_request(f"/api/live/{room_id}/stop", "POST", headers={"x-live-key": key})
+
+
 def test_upload_download():
     payload = os.urandom(3 * 1024 * 1024 + 12345)
     digest = hashlib.sha256(payload).hexdigest()
@@ -488,6 +531,7 @@ def main():
     test_live_relay()
     test_live_viewer_joins_before_first_chunk()
     test_live_tail_ring_buffer()
+    test_live_reset_for_camera_switch()
     test_delete(file_id, empty_id)
 
     print()

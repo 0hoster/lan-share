@@ -209,6 +209,8 @@ def main():
             "--use-fake-ui-for-media-stream", "--use-fake-device-for-media-stream",
             "--autoplay-policy=no-user-gesture-required",
             "--no-proxy-server",
+            # 自签证书场景（--tls）需要用 https 访问，这里忽略证书错误
+            "--ignore-certificate-errors",
             f"--remote-debugging-port={DEBUG_PORT}", f"--user-data-dir={profile}",
             "--window-size=1280,900", "about:blank",
         ],
@@ -372,6 +374,30 @@ def main():
         check("观看端 MSE 实时播放成功", bool(playing and playing.get("ok")), playing)
         if playing and playing.get("ok"):
             print(f"      已播放到 {playing['currentTime']:.1f}s，缓冲 {playing['buffered']:.1f}s")
+
+        # 手机场景的核心操作：切换前后摄像头后观众应自动重新同步并继续播放
+        flip_js = """
+        (async () => {
+          const live = window.__lanShareLive;
+          if (!live.cast) return { ok: false, reason: '没有正在进行的推流' };
+          const roomBefore = live.cast.roomId;
+          document.getElementById('live-flip').click();
+          const video = document.getElementById('live-player');
+          const started = Date.now();
+          while (Date.now() - started < 30000) {
+            const cast = live.cast;
+            if (cast && !cast.flipping && cast.chunks > 0 && video.currentTime > 0.1) {
+              return { ok: true, sameRoom: cast.roomId === roomBefore, currentTime: video.currentTime };
+            }
+            await new Promise(r => setTimeout(r, 300));
+          }
+          return { ok: false, reason: document.getElementById('live-player-status').innerText.trim() };
+        })()
+        """
+        flipped = cdp.evaluate(flip_js)
+        check("切换摄像头后观众自动恢复播放", bool(flipped and flipped.get("ok")), flipped)
+        if flipped and flipped.get("ok"):
+            print(f"      切换后房间号保持不变: {flipped['sameRoom']}，播放到 {flipped['currentTime']:.1f}s")
 
         if SHOT:
             shot = cdp.call("Page.captureScreenshot", {"format": "png", "captureBeyondViewport": True})

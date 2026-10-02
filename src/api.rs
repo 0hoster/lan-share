@@ -46,6 +46,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/live/start", post(live::start))
         .route("/live/{id}/chunk", put(live::push_chunk))
         .route("/live/{id}/stop", post(live::stop))
+        .route("/live/{id}/reset", post(live::reset))
         .route("/live/{id}/ws", get(live::viewer))
         // 分片上传：单个请求体最大约 64 MiB，足够覆盖默认分片大小
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))

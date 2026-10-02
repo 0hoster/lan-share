@@ -109,7 +109,10 @@
   function describeSupport() {
     const hint = $('#live-support');
     if (!window.MediaRecorder || !navigator.mediaDevices) {
-      hint.textContent = '当前浏览器不支持录屏推送，请用 Chrome / Edge / Firefox';
+      // 局域网 IP + http 时浏览器会直接隐藏 mediaDevices（安全上下文限制）
+      hint.innerHTML = isSecure() 
+        ? '当前浏览器不支持录制推送，请用 Chrome / Edge / Firefox'
+        : '当前是 <b>http</b> 访问，浏览器禁用了采集能力：请用 <code>--tls</code> 启动后以 <b>https</b> 打开本页';
       $('#live-start-screen').disabled = true;
       $('#live-start-camera').disabled = true;
       return;
@@ -120,6 +123,77 @@
       $('#live-start-screen').disabled = true;
       $('#live-start-camera').disabled = true;
     }
+  }
+
+  /** getUserMedia / getDisplayMedia 只在安全上下文可用 */
+  function isSecure() {
+    if (window.isSecureContext) return true;
+    const host = location.hostname;
+    return host === 'localhost' || host === '127.0.0.1' || host === '[::1]';
+  }
+
+  function isMobile() {
+    return /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+  }
+
+  /** 摄像头画质档位：手机默认用标清，省电省流量 */
+  const QUALITY = {
+    low: { width: 854, height: 480, bps: 1_200_000 },
+    medium: { width: 1280, height: 720, bps: 2_800_000 },
+    high: { width: 1920, height: 1080, bps: 6_000_000 },
+  };
+
+  function currentQuality() {
+    const select = $('#live-quality');
+    return QUALITY[select ? select.value : 'medium'] || QUALITY.medium;
+  }
+
+  /** 手机默认后置摄像头，桌面默认前置（笔记本更常见） */
+  function preferredFacing() {
+    const select = $('#live-facing');
+    if (select && select.value) return select.value;
+    return isMobile() ? 'environment' : 'user';
+  }
+
+  function cameraConstraints(facing, deviceId) {
+    const quality = currentQuality();
+    const video = {
+      width: { ideal: quality.width },
+      height: { ideal: quality.height },
+      frameRate: { ideal: 24, max: 30 },
+    };
+    if (deviceId) {
+      video.deviceId = { exact: deviceId };
+    } else if (facing) {
+      video.facingMode = { ideal: facing };
+    }
+    return { video };
+  }
+
+  function cameraStream(facing, deviceId) {
+    return navigator.mediaDevices.getUserMedia(cameraConstraints(facing, deviceId));
+  }
+
+  /** 列出摄像头，手机上有前置/后置两个 */
+  async function refreshCameras() {
+    const select = $('#live-device');
+    if (!select || !navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+    try {
+      const devices = (await navigator.mediaDevices.enumerateDevices())
+        .filter((device) => device.kind === 'videoinput');
+      if (devices.length === 0) return;
+      const current = select.value;
+      select.innerHTML = '<option value="">默认摄像头</option>';
+      devices.forEach((device, index) => {
+        const option = document.createElement('option');
+        option.value = device.deviceId;
+        option.textContent = device.label || `摄像头 ${index + 1}`;
+        select.appendChild(option);
+      });
+      if (current && devices.some((device) => device.deviceId === current)) {
+        select.value = current;
+      }
+    } catch (_) { /* 未授权时拿不到标签，忽略 */ }
   }
 
   /** 分片编码必须和实际音轨匹配：没有音轨却声明 opus，播放端会初始化失败 */
@@ -192,11 +266,15 @@
       toast('已经在直播中', 'err');
       return;
     }
+    if (!isSecure()) {
+      toast('当前是 http 访问，浏览器不允许调用摄像头/屏幕；请用 https 打开', 'err');
+      return;
+    }
     let captured;
     try {
       captured = source === 'screen'
         ? await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 24 }, audio: true })
-        : await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720, frameRate: 24 } });
+        : await cameraStream(preferredFacing());
     } catch (err) {
       toast('没有拿到采集源：' + (err && err.message ? err.message : err), 'err');
       return;
@@ -243,11 +321,18 @@
       key: session.key,
       title,
       mime,
+      source,
+      facing: source === 'camera' ? preferredFacing() : null,
+      deviceId: $('#live-device') ? $('#live-device').value : '',
+      bps: currentQuality().bps,
       stream,
       captured,
+      micStream: stream.__keepAlive ? stream.__keepAlive.micStream : null,
       queue: [],
       sending: false,
       stopping: false,
+      settled: false,
+      flipping: false,
       bytes: 0,
       chunks: 0,
       viewers: 0,
@@ -259,30 +344,14 @@
     };
     state.cast = cast;
 
-    const recorder = new MediaRecorder(stream, {
-      mimeType: mime,
-      videoBitsPerSecond: 4_000_000,
-      audioBitsPerSecond: 128_000,
-    });
-    cast.recorder = recorder;
-    recorder.ondataavailable = (event) => {
-      if (!event.data || event.data.size === 0) return;
-      if (cast.settled) return; // 已经收尾完毕，丢弃迟到的分片
-      cast.queue.push(event.data);
-      pumpQueue();
-    };
-    recorder.onerror = (event) => fail('录制出错：' + (event.error && event.error.name));
-
-    // 用户点浏览器自带的「停止共享」时同步结束
-    captured.getVideoTracks().forEach((track) => {
-      track.addEventListener('ended', () => { if (!cast.stopping) stopBroadcast(); });
-    });
-
-    recorder.start(1000);
+    makeRecorder(cast);
+    bindTrackEnded(cast);
 
     $('#live-preview').srcObject = stream;
     $('#live-preview').play().catch(() => { /* 预览失败不影响推流 */ });
     $('#live-self').hidden = false;
+    $('#live-flip').disabled = source !== 'camera';
+    refreshCameras();
     $('#live-title').disabled = true;
     $('#live-start-screen').disabled = true;
     $('#live-start-camera').disabled = true;
@@ -304,6 +373,143 @@
     ]);
     mixed.__keepAlive = { ctx, micStream };
     return mixed;
+  }
+
+  /** 创建并启动录制器：每次切换采集源都会新建一个（所以要 reset 房间） */
+  function makeRecorder(cast) {
+    const mime = pickMime(cast.stream.getAudioTracks().length > 0);
+    if (!mime) throw new Error('当前浏览器不支持 WebM 录制');
+    cast.mime = mime;
+    const recorder = new MediaRecorder(cast.stream, {
+      mimeType: mime,
+      videoBitsPerSecond: cast.bps,
+      audioBitsPerSecond: 128_000,
+    });
+    cast.recorder = recorder;
+    recorder.ondataavailable = (event) => {
+      if (!event.data || event.data.size === 0) return;
+      if (cast.settled) return; // 已经收尾完毕，丢弃迟到的分片
+      cast.queue.push(event.data);
+      pumpQueue();
+    };
+    recorder.onerror = (event) => fail('录制出错：' + (event.error && event.error.name));
+    recorder.start(1000);
+    return recorder;
+  }
+
+  /** 停止录制器，并等已产生的分片推完 */
+  async function stopRecorder(cast) {
+    const recorder = cast.recorder;
+    if (!recorder || recorder.state === 'inactive') return;
+    await new Promise((resolve) => {
+      let done = false;
+      const finish = () => {
+        if (!done) {
+          done = true;
+          resolve();
+        }
+      };
+      recorder.addEventListener('stop', finish, { once: true });
+      try {
+        recorder.stop();
+      } catch (_) {
+        finish();
+      }
+      setTimeout(finish, 3000);
+    });
+    const deadline = Date.now() + 5000;
+    while ((cast.queue.length > 0 || cast.sending) && Date.now() < deadline) {
+      await sleep(150);
+    }
+  }
+
+  function releaseStream(stream) {
+    if (!stream) return;
+    try {
+      stream.getTracks().forEach((track) => track.stop());
+    } catch (_) { /* ignore */ }
+    if (stream.__keepAlive) {
+      try {
+        stream.__keepAlive.micStream.getTracks().forEach((track) => track.stop());
+      } catch (_) { /* ignore */ }
+      try {
+        stream.__keepAlive.ctx.close();
+      } catch (_) { /* ignore */ }
+    }
+  }
+
+  function bindTrackEnded(cast) {
+    cast.captured.getVideoTracks().forEach((track) => {
+      track.addEventListener('ended', () => {
+        if (!cast.stopping) stopBroadcast();
+      });
+    });
+  }
+
+  /** 切换采集源（摄像头前后切换 / 换设备），房间号不变，观众自动重新同步 */
+  async function switchCamera(options) {
+    const cast = state.cast;
+    if (!cast || cast.flipping) return;
+    if (cast.source !== 'camera') {
+      toast('只有摄像头直播可以切换镜头', 'err');
+      return;
+    }
+    cast.flipping = true;
+    const flipButton = $('#live-flip');
+    if (flipButton) flipButton.disabled = true;
+    try {
+      const nextFacing = options.facing || cast.facing;
+      const nextDevice = options.deviceId !== undefined ? options.deviceId : cast.deviceId;
+      cast.bps = currentQuality().bps;
+      const captured = await cameraStream(nextFacing, nextDevice);
+
+      await stopRecorder(cast);
+      releaseStream(cast.stream);
+      cast.captured.getTracks().forEach((track) => track.stop());
+      cast.captured = captured;
+
+      let stream = captured;
+      if (cast.micStream) {
+        stream = mixAudio(captured, cast.micStream);
+      }
+      cast.stream = stream;
+      cast.facing = nextFacing;
+      cast.deviceId = nextDevice;
+
+      // 新的 MediaRecorder 会重新生成 WebM 初始化分片，让观众重连取快照
+      await fetch(withToken(`/api/live/${cast.roomId}/reset`), {
+        method: 'POST',
+        headers: authHeaders({ 'x-live-key': cast.key }),
+      });
+      cast.settled = false;
+      makeRecorder(cast);
+      bindTrackEnded(cast);
+
+      const preview = $('#live-preview');
+      preview.srcObject = stream;
+      preview.play().catch(() => { /* ignore */ });
+      toast(nextFacing === 'environment' ? '已切换到后置摄像头' : '已切换到前置摄像头', 'ok');
+    } catch (err) {
+      toast('切换摄像头失败：' + (err && err.message ? err.message : err), 'err');
+      if (!cast.recorder || cast.recorder.state === 'inactive') {
+        try {
+          makeRecorder(cast);
+        } catch (inner) {
+          fail('切换后无法继续推流：' + inner.message);
+        }
+      }
+    } finally {
+      cast.flipping = false;
+      if (flipButton) flipButton.disabled = false;
+      refreshCameras();
+    }
+  }
+
+  function flipCamera() {
+    const cast = state.cast;
+    if (!cast) return;
+    const next = cast.facing === 'user' ? 'environment' : 'user';
+    return switchCamera({ facing: next });
   }
 
   /** 顺序把分片推给服务端（顺序发送可以保证时间戳单调） */
@@ -354,27 +560,8 @@
     if (!cast || cast.stopping) return;
     cast.stopping = true;
 
-    // 先等录制器把最后一个分片吐出来，否则那一片会在房间结束后才发出
-    const recorderDone = new Promise((resolve) => {
-      const recorder = cast.recorder;
-      if (!recorder || recorder.state === 'inactive') {
-        resolve();
-        return;
-      }
-      recorder.addEventListener('stop', () => resolve(), { once: true });
-      try {
-        recorder.stop();
-      } catch (_) {
-        resolve();
-      }
-    });
-    await Promise.race([recorderDone, sleep(3000)]);
-
-    // 等剩余分片推完（最多 8 秒），避免丢掉最后一小段
-    const deadline = Date.now() + 8000;
-    while ((cast.queue.length > 0 || cast.sending) && Date.now() < deadline) {
-      await sleep(200);
-    }
+    // 先等录制器把最后一个分片吐出来并推完，否则那一片会在房间结束后才发出
+    await stopRecorder(cast);
     cast.settled = true;
 
     try {
@@ -395,17 +582,14 @@
   }
 
   function cleanupCast(cast) {
+    releaseStream(cast.stream);
     try {
-      cast.stream.getTracks().forEach((track) => track.stop());
       cast.captured.getTracks().forEach((track) => track.stop());
-      if (cast.stream.__keepAlive) {
-        cast.stream.__keepAlive.micStream.getTracks().forEach((track) => track.stop());
-        cast.stream.__keepAlive.ctx.close();
-      }
     } catch (_) { /* ignore */ }
     if (state.cast === cast) state.cast = null;
     $('#live-preview').srcObject = null;
     $('#live-self').hidden = true;
+    $('#live-flip').disabled = true;
     $('#live-title').disabled = false;
     $('#live-start-screen').disabled = false;
     $('#live-start-camera').disabled = false;
@@ -494,6 +678,10 @@
           try { ws.close(); } catch (_) { /* ignore */ }
         } else if (msg.type === 'lagged') {
           setStatus('网络较慢，正在重新同步…');
+          reconnect();
+        } else if (msg.type === 'reset') {
+          // 主播换了采集源（例如切换摄像头），重新取快照
+          setStatus('主播切换了画面来源，正在重新同步…');
           reconnect();
         } else if (msg.type === 'info') {
           player.info = msg.room;
@@ -632,6 +820,23 @@
     $('#live-stop').addEventListener('click', () => stopBroadcast());
     $('#live-refresh').addEventListener('click', () => loadRooms());
     $('#live-leave').addEventListener('click', () => closePlayer());
+    $('#live-flip').addEventListener('click', () => flipCamera());
+    $('#live-device').addEventListener('change', (event) => {
+      if (state.cast && state.cast.source === 'camera') {
+        switchCamera({ deviceId: event.target.value, facing: null });
+      }
+    });
+    $('#live-quality').addEventListener('change', () => {
+      if (state.cast && state.cast.source === 'camera' && !state.cast.flipping) {
+        toast('画质已切换，正在重连画面…', 'ok');
+        switchCamera({ deviceId: state.cast.deviceId, facing: state.cast.facing });
+      }
+    });
+
+    if (isMobile()) {
+      $('#live-facing').value = 'environment';
+    }
+    refreshCameras();
 
     setInterval(updateCastStats, 500);
     // 直播列表定时刷新（只在直播页可见时发请求）

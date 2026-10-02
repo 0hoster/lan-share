@@ -25,6 +25,10 @@ pub struct EnvConfig {
     pub live_max_rooms: Option<usize>,
     pub live_max_viewers: Option<usize>,
     pub live_idle_secs: Option<u64>,
+    /// 是否启用 HTTPS（手机摄像头直播需要）
+    pub tls: Option<bool>,
+    pub tls_cert: Option<PathBuf>,
+    pub tls_key: Option<PathBuf>,
 }
 
 /// 解析 .env 文件并注入进程环境（不覆盖已存在的变量），返回生效的条目数。
@@ -123,6 +127,9 @@ impl EnvConfig {
             live_max_rooms: env_parse("LAN_SHARE_LIVE_MAX_ROOMS"),
             live_max_viewers: env_parse("LAN_SHARE_LIVE_MAX_VIEWERS"),
             live_idle_secs: env_parse("LAN_SHARE_LIVE_IDLE_SECS"),
+            tls: env_bool("LAN_SHARE_TLS"),
+            tls_cert: env_string("LAN_SHARE_TLS_CERT").map(PathBuf::from),
+            tls_key: env_string("LAN_SHARE_TLS_KEY").map(PathBuf::from),
         }
     }
 }
