@@ -293,31 +293,34 @@ def main():
           document.getElementById('live-title').value = '浏览器自动化直播';
           document.getElementById('live-record').checked = true;
           document.getElementById('live-start-camera').click();
+
+          // 房间一出现在列表里就立刻点「观看」——这时通常还没有任何分片，
+          // 正好覆盖「开播瞬间加入」这条曾经出错的路径
           const started = Date.now();
           while (Date.now() - started < 30000) {
-            if (live.cast && live.cast.bytes > 0 && live.rooms.length > 0) {
-              return { ok: true, roomId: live.cast.roomId, bytes: live.cast.bytes, chunks: live.cast.chunks, rooms: live.rooms.length };
+            const watch = document.querySelector('#live-list .row [data-watch]');
+            if (watch) {
+              const beforeChunks = live.cast ? live.cast.chunks : 0;
+              watch.click();
+              return { ok: true, roomId: live.cast.roomId, chunksBeforeWatch: beforeChunks };
             }
-            await new Promise(r => setTimeout(r, 300));
+            await new Promise(r => setTimeout(r, 100));
           }
-          return { ok: false, reason: '开播超时' };
+          return { ok: false, reason: '开播后房间未出现在列表' };
         })()
         """
         live = cdp.evaluate(live_start_js)
         check("浏览器开播（真实 MediaRecorder 采集）", bool(live and live.get("ok")), live)
         if live and live.get("ok"):
-            print(f"      房间 {live['roomId']} 已推流 {live['bytes']} 字节 / {live['chunks']} 个分片")
+            print(f"      房间 {live['roomId']}，点观看时分片数={live['chunksBeforeWatch']}")
 
         live_watch_js = """
         (async () => {
           const live = window.__lanShareLive;
-          const button = document.querySelector('#live-list .row [data-watch]');
-          if (!button) return { ok: false, reason: '列表里没有可观看的直播' };
-          button.click();
           const video = document.getElementById('live-player');
           const started = Date.now();
           while (Date.now() - started < 20000) {
-            if (video.readyState >= 2 && video.currentTime > 0.2) {
+            if (video.readyState >= 2 && video.currentTime > 0.1) {
               return {
                 ok: true,
                 currentTime: video.currentTime,

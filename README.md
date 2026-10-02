@@ -229,7 +229,8 @@ cargo run --release -- --token mySecret   # 指定令牌
 ## 测试
 
 ```bash
-# 端到端接口测试（49 项：上传/下载/Range/416/乱序分片/删除/鉴权/WebSocket/直播推流与录像）
+# 端到端接口测试（56 项：上传/下载/Range/416/乱序分片/删除/鉴权/WebSocket/直播推流与录像；
+# 带 --token 时另有 3 项鉴权用例）
 python3 scripts/e2e_test.py http://127.0.0.1:8080
 
 # 吞吐量基准

@@ -54,6 +54,15 @@ pub fn router(state: Arc<AppState>) -> Router {
             auth_middleware,
         ));
 
+    // 事件流同样可能泄露文件名，开启令牌时必须一起鉴权
+    let events =
+        Router::new()
+            .route("/ws", get(ws::handler))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ));
+
     Router::new()
         .route("/", get(index))
         .route("/index.html", get(index))
@@ -61,7 +70,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/live.js", get(live_js))
         .route("/styles.css", get(styles_css))
         .route("/favicon.ico", get(favicon))
-        .route("/ws", get(ws::handler))
+        .merge(events)
         .nest("/api", api)
         .with_state(state)
 }

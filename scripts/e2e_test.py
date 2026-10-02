@@ -142,15 +142,30 @@ def test_auth_required():
         status = err.code
     check("api without token returns 401", status == 401, status)
 
+    # 事件流同样要有鉴权，否则文件增删事件会泄露给局域网里任何人
+    try:
+        client = WsClient("/ws", send_token=False)
+        check("websocket without token is rejected", "101" not in client.status_line, client.status_line)
+        client.close()
+    except OSError as err:
+        check("websocket without token is rejected", False, err)
+
+    try:
+        client = WsClient("/ws")
+        check("websocket with token is accepted", "101" in client.status_line, client.status_line)
+        client.close()
+    except OSError as err:
+        check("websocket with token is accepted", False, err)
+
 
 class WsClient:
     """够用的 WebSocket 客户端：文本 + 二进制帧，用于验证实时转发。"""
 
-    def __init__(self, path, timeout=15):
+    def __init__(self, path, timeout=15, send_token=True):
         parsed = urlparse(BASE)
         host = parsed.hostname or "127.0.0.1"
         port = parsed.port or 80
-        if TOKEN:
+        if TOKEN and send_token:
             path += ("&" if "?" in path else "?") + "token=" + TOKEN
         self.sock = socket.create_connection((host, port), timeout=timeout)
         self.buf = b""
@@ -306,6 +321,66 @@ def test_live_relay():
         pass
 
 
+def test_live_viewer_joins_before_first_chunk():
+    """开播瞬间（房间已出现但还没有任何分片）就加入的观众，必须拿到初始化分片。"""
+    status, _, start = json_request(
+        "/api/live/start", "POST", {"title": "空房间边界", "mime": "video/webm", "record": False}
+    )
+    assert status == 200, start
+    room_id, key = start["room_id"], start["key"]
+
+    viewer = WsClient(f"/api/live/{room_id}/ws")
+    info = json.loads(viewer.recv_text())
+    check("live: 空房间也能加入并收到 info", info.get("type") == "info", info)
+
+    init_segment = b"\x1a\x45\xdf\xa3INIT-ON-EMPTY-ROOM"
+    request(f"/api/live/{room_id}/chunk", "PUT", init_segment, headers={"x-live-key": key})
+    request(f"/api/live/{room_id}/chunk", "PUT", b"chunk-after-init", headers={"x-live-key": key})
+
+    first = viewer.recv_binary()
+    check("live: 开播瞬间加入的观众能拿到初始化分片", first == init_segment, len(first))
+    second = viewer.recv_binary()
+    check("live: 初始化分片之后的分片接续正确", second == b"chunk-after-init", len(second))
+
+    json_request(f"/api/live/{room_id}/stop", "POST", headers={"x-live-key": key})
+    ended = json.loads(viewer.recv_text())
+    check("live: 主播结束后观众收到 ended", ended.get("type") == "ended", ended)
+    viewer.close()
+
+
+def test_live_tail_ring_buffer():
+    """长时间直播后新加入的观众：保留初始化分片、只补最近一段、不能有重复。"""
+    status, _, start = json_request(
+        "/api/live/start", "POST", {"title": "尾部缓冲边界", "mime": "video/webm", "record": False}
+    )
+    assert status == 200, start
+    room_id, key = start["room_id"], start["key"]
+
+    init_segment = b"\x1a\x45\xdf\xa3RING-INIT"
+    request(f"/api/live/{room_id}/chunk", "PUT", init_segment, headers={"x-live-key": key})
+    # 24 MiB 是服务端保留的尾部预算，这里推 26 MiB 触发裁剪
+    payload = bytes(range(256)) * (1024 * 4)  # 1 MiB
+    for _ in range(26):
+        request(f"/api/live/{room_id}/chunk", "PUT", payload, headers={"x-live-key": key})
+
+    viewer = WsClient(f"/api/live/{room_id}/ws")
+    json.loads(viewer.recv_text())
+    received = [viewer.recv_binary()]
+    viewer.sock.settimeout(2)
+    try:
+        while True:
+            received.append(viewer.recv_binary())
+    except (TimeoutError, OSError):
+        pass
+
+    check("live: 裁剪后仍保留初始化分片", received[0] == init_segment, len(received[0]))
+    check("live: 只补齐最近的尾部而非全量", 2 <= len(received) <= 26, len(received))
+    check("live: 分片内容为 1MiB 的媒体分片", all(len(c) == len(payload) for c in received[1:]))
+
+    json_request(f"/api/live/{room_id}/stop", "POST", headers={"x-live-key": key})
+    viewer.close()
+
+
 def test_upload_download():
     payload = os.urandom(3 * 1024 * 1024 + 12345)
     digest = hashlib.sha256(payload).hexdigest()
@@ -411,6 +486,8 @@ def main():
     file_id = test_upload_download()
     empty_id = test_edge_cases()
     test_live_relay()
+    test_live_viewer_joins_before_first_chunk()
+    test_live_tail_ring_buffer()
     test_delete(file_id, empty_id)
 
     print()

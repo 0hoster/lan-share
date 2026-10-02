@@ -14,6 +14,11 @@
     player: null, // 观看中的会话
   };
 
+  /** 推流端最多容忍多少个分片积压（约 1 分钟），超过就判定网络跟不上 */
+  const MAX_PENDING_CHUNKS = 60;
+  /** 观看端还没喂给播放器的分片上限，超过就重连取快照 */
+  const MAX_BUFFERED_CHUNKS = 300;
+
   // ---------------------------------------------------------------- 工具
 
   const withToken = (url) =>
@@ -322,6 +327,11 @@
         cast.bytes = info.bytes;
         cast.chunks = info.seq + 1;
         cast.viewers = info.viewers;
+        // 网络长期跟不上采集速度时，积压会让内存无限增长，不如直接停下来
+        if (cast.queue.length > MAX_PENDING_CHUNKS) {
+          fail('网络过慢，已排队 ' + cast.queue.length + ' 个分片，直播已停止');
+          break;
+        }
       } catch (err) {
         fail('推流中断：' + err.message);
         break;
@@ -492,6 +502,12 @@
       }
       player.bytes += event.data.byteLength;
       player.queue.push(new Uint8Array(event.data));
+      // 播放器严重落后时，与其越堆越多，不如重连拿一份新的快照
+      if (player.queue.length > MAX_BUFFERED_CHUNKS) {
+        setStatus('播放落后过多，正在重新同步…');
+        reconnect();
+        return;
+      }
       pump();
     };
     ws.onclose = () => {
@@ -631,15 +647,9 @@
 
   window.addEventListener('beforeunload', () => {
     if (state.player) closePlayer();
-    if (state.cast) {
-      try { state.cast.recorder.stop(); } catch (_) { /* ignore */ }
-      try {
-        navigator.sendBeacon(
-          withToken(`/api/live/${state.cast.roomId}/stop`),
-          new Blob([], { type: 'text/plain' })
-        );
-      } catch (_) { /* ignore */ }
-    }
+    // 页面被关掉/刷新时无法再带 x-live-key 头调用 stop 接口，
+    // 交给服务端的空闲超时来收尾（会把已录部分保存成文件）。
+    try { state.cast && state.cast.recorder.stop(); } catch (_) { /* ignore */ }
   });
 
   // 暴露给自动化测试使用的最小接口

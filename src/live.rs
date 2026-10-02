@@ -192,9 +192,14 @@ impl Room {
         seq
     }
 
-    /// 观众加入时需要的快照：初始化分片 + 最近分片 + 最新序号
-    pub fn snapshot(&self) -> (Option<Bytes>, Vec<Chunk>, u64) {
-        let last_seq = self.seq.load(Ordering::SeqCst).saturating_sub(1);
+    /// 观众加入时需要的快照：初始化分片 + 最近分片 + 已推送到的最后一个序号。
+    ///
+    /// 注意返回的是 `i64`：房间还没有任何分片时是 -1，不能像以前那样用
+    /// `saturating_sub(1)` 得到 0，否则 seq=0 的初始化分片会被判定为
+    /// 「快照里已经发过」而丢掉，观众将永远拿不到 WebM 初始化段。
+    pub fn snapshot(&self) -> (Option<Bytes>, Vec<Chunk>, i64) {
+        let pushed = self.seq.load(Ordering::SeqCst);
+        let last_seq = pushed as i64 - 1;
         let init = self.init.lock().ok().and_then(|guard| guard.clone());
         let tail = self
             .tail
@@ -524,7 +529,7 @@ async fn run_viewer(mut socket: WebSocket, room: Arc<Room>) {
         tokio::select! {
             message = rx.recv() => match message {
                 Ok(LiveMsg::Chunk(chunk)) => {
-                    if chunk.seq <= snapshot_seq {
+                    if chunk.seq as i64 <= snapshot_seq {
                         continue; // 快照里已经发过
                     }
                     if socket.send(Message::Binary(chunk.data)).await.is_err() {
