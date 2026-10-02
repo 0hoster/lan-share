@@ -306,6 +306,45 @@ button.act:disabled { opacity: .5; cursor: not-allowed; }
   color: var(--text-soft); font-size: 12px;
 }
 
+/* ---------------- 顶部实时统计条 ---------------- */
+
+.statbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  max-width: 1080px;
+  width: 100%;
+  margin: 0 auto;
+  padding: 0 clamp(16px, 4vw, 40px) 12px;
+  font-size: 12.5px;
+  color: var(--text-soft);
+}
+
+.statbar .stat {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--card);
+  border: 1px solid var(--card-border);
+  border-radius: 999px;
+  padding: 5px 12px;
+  white-space: nowrap;
+}
+
+.statbar b { color: var(--text); font-weight: 600; }
+
+.signal { display: inline-flex; align-items: flex-end; gap: 2px; height: 13px; }
+.signal i { width: 3px; background: var(--card-border); border-radius: 1px; transition: background .2s; }
+.signal i:nth-child(1) { height: 4px; }
+.signal i:nth-child(2) { height: 7px; }
+.signal i:nth-child(3) { height: 10px; }
+.signal i:nth-child(4) { height: 13px; }
+.signal i.on { background: var(--ok); }
+.signal.lvl-3 i.on { background: var(--ok); }
+.signal.lvl-2 i.on { background: var(--warn); }
+.signal.lvl-1 i.on, .signal.lvl-0 i.on { background: var(--err); }
+
 .toasts {
   position: fixed; right: 18px; bottom: 18px;
   display: flex; flex-direction: column; gap: 8px; z-index: 50;

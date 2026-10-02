@@ -227,6 +227,24 @@ async fn list_uploads(State(state): State<Arc<AppState>>) -> ApiResult<Json<Vec<
 }
 
 async fn stats(State(state): State<Arc<AppState>>) -> ApiResult<Json<Stats>> {
+    let mut active: Vec<UploadStatus> = state
+        .sessions
+        .iter()
+        .map(|entry| {
+            let session = entry.value();
+            UploadStatus {
+                upload_id: session.id,
+                name: session.name.clone(),
+                size: session.size,
+                chunk_size: session.chunk_size,
+                chunk_count: session.chunk_count,
+                received: session.received_count(),
+                received_bytes: session.received_bytes.load(Ordering::Relaxed),
+            }
+        })
+        .collect();
+    active.sort_by_key(|item| std::cmp::Reverse(item.received_bytes));
+
     Ok(Json(Stats {
         files: state.files.len(),
         bytes: state.total_bytes(),
@@ -234,6 +252,7 @@ async fn stats(State(state): State<Arc<AppState>>) -> ApiResult<Json<Stats>> {
         live: state.live.len(),
         uptime_secs: state.started.elapsed().as_secs(),
         chunk_size: state.chunk_size,
+        active_uploads: active,
     }))
 }
 

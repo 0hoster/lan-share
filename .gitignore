@@ -1,5 +1,7 @@
 /target
 /dist
+/src/.env
+/.env
 /lan-share-data
 **/.DS_Store
 

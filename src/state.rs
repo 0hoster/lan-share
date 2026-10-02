@@ -62,12 +62,36 @@ pub struct AppState {
     pub events: broadcast::Sender<Event>,
     /// 正在进行的直播房间
     pub live: LiveHub,
+    pub limits: LiveLimits,
     pub token: Option<String>,
     pub started: Instant,
 }
 
+/// 直播相关上限，可通过 CLI / .env 覆盖
+#[derive(Debug, Clone)]
+pub struct LiveLimits {
+    pub max_rooms: usize,
+    pub max_viewers: usize,
+    pub idle_timeout: std::time::Duration,
+}
+
+impl Default for LiveLimits {
+    fn default() -> Self {
+        Self {
+            max_rooms: 8,
+            max_viewers: 32,
+            idle_timeout: std::time::Duration::from_secs(90),
+        }
+    }
+}
+
 impl AppState {
-    pub fn new(data_dir: &Path, chunk_size: u64, token: Option<String>) -> anyhow::Result<Self> {
+    pub fn new(
+        data_dir: &Path,
+        chunk_size: u64,
+        token: Option<String>,
+        limits: LiveLimits,
+    ) -> anyhow::Result<Self> {
         let files_dir = data_dir.join("files");
         let meta_dir = data_dir.join("meta");
         let tmp_dir = data_dir.join("tmp");
@@ -92,6 +116,7 @@ impl AppState {
             files: DashMap::new(),
             events,
             live: LiveHub::new(),
+            limits,
             token,
             started: Instant::now(),
         };

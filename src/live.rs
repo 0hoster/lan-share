@@ -33,12 +33,6 @@ use crate::state::{now_secs, AppState};
 const MAX_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 /// 给新观众保留的最近数据量，够快进到接近直播点
 const TAIL_BUDGET_BYTES: usize = 24 * 1024 * 1024;
-/// 同时进行的直播上限
-const MAX_ROOMS: usize = 8;
-/// 单房间观众上限
-const MAX_VIEWERS: usize = 32;
-/// 多久没有新分片就认为主播掉线
-const IDLE_TIMEOUT: Duration = Duration::from_secs(90);
 /// 广播通道容量（分片数）；观众消费不过来时会被标记 Lagged 并让其重连
 const BROADCAST_CAPACITY: usize = 512;
 
@@ -287,10 +281,11 @@ impl LiveHub {
 
     /// 创建房间；开启录制时同时准备好临时录像文件。
     pub async fn create(&self, state: &AppState, req: StartReq) -> ApiResult<StartResp> {
-        if self.rooms.len() >= MAX_ROOMS {
+        let max_rooms = state.limits.max_rooms;
+        if max_rooms > 0 && self.rooms.len() >= max_rooms {
             return Err(ApiError::new(
                 StatusCode::TOO_MANY_REQUESTS,
-                "同时进行的直播过多，请稍后再试",
+                format!("同时进行的直播过多（上限 {max_rooms} 路），请稍后再试"),
             ));
         }
 
@@ -474,10 +469,11 @@ pub async fn viewer(
         .live
         .get(&room_id)
         .ok_or_else(|| ApiError::not_found("直播不存在或已结束"))?;
-    if room.viewers.load(Ordering::Relaxed) >= MAX_VIEWERS {
+    let max_viewers = state.limits.max_viewers;
+    if max_viewers > 0 && room.viewers.load(Ordering::Relaxed) >= max_viewers {
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
-            "观看人数已达上限",
+            format!("观看人数已达上限（{max_viewers} 人）"),
         ));
     }
     Ok(ws.on_upgrade(move |socket| run_viewer(socket, room)))
@@ -605,7 +601,7 @@ pub fn spawn_janitor(state: Arc<AppState>) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(30)).await;
-            for room in state.live.stale(IDLE_TIMEOUT) {
+            for room in state.live.stale(state.limits.idle_timeout) {
                 if state.live.remove(&room.id).is_none() {
                     continue;
                 }

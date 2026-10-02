@@ -261,6 +261,27 @@ def main():
         check("服务端保存了浏览器上传的文件", bool(listed and listed.get("found")), listed)
         check("服务端数据与浏览器原始数据一致", bool(listed and listed.get("shaMatches")), listed)
 
+        # ------------------------------------------------------ 顶部实时统计条
+        statbar = cdp.evaluate("""
+        (() => {
+          const pick = (id) => (document.getElementById(id) || {}).textContent || '';
+          return {
+            signal: pick('signal-text').trim(),
+            signalClass: document.getElementById('signal-bars').className,
+            active: pick('stat-active').trim(),
+            remaining: pick('stat-remaining').trim(),
+            remainingBytes: pick('stat-remaining-bytes').trim(),
+            chunks: pick('stat-chunks').trim(),
+            live: pick('stat-live').trim(),
+            server: pick('stat-server').trim(),
+          };
+        })()
+        """)
+        check("统计条：显示到服务端的延迟", "延迟" in statbar.get("signal", ""), statbar)
+        check("统计条：信号等级已判定", "lvl-" in statbar.get("signalClass", ""), statbar.get("signalClass"))
+        check("统计条：分段统计可用", "/" in statbar.get("chunks", ""), statbar.get("chunks"))
+        check("统计条：显示服务端文件统计", "服务端" in statbar.get("server", ""), statbar.get("server"))
+
         # 点击下载按钮，验证浏览器侧 Range 并行下载与重组
         download_js = """
         (async () => {

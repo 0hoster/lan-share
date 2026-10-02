@@ -49,6 +49,8 @@ pub struct Stats {
     pub live: usize,
     pub uptime_secs: u64,
     pub chunk_size: u64,
+    /// 正在进行的传输明细（终端面板与网页端都用它）
+    pub active_uploads: Vec<UploadStatus>,
 }
 
 /// 通过 WebSocket 广播给所有浏览器的事件。
