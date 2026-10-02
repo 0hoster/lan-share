@@ -12,6 +12,8 @@
     wsRetry: 0,
     serverChunkSize: 8 * 1024 * 1024,
     search: '',
+    rtt: null,
+    serverStats: null,
   };
 
   if (state.token) localStorage.setItem('lan-share-token', state.token);
@@ -110,12 +112,71 @@
       const resp = await fetch(withToken('/api/stats'), { headers: authHeaders() });
       if (!resp.ok) return;
       const stats = await resp.json();
+      state.serverStats = stats;
       $('#stats-text').textContent = `${stats.files} 个文件 · ${fmtBytes(stats.bytes)}`;
       state.serverChunkSize = stats.chunk_size || state.serverChunkSize;
       $('#chunk-hint').textContent = '分片 ' + fmtBytes(state.serverChunkSize);
       $('#foot-info').textContent =
         `服务端分片 ${fmtBytes(stats.chunk_size)} · 已运行 ${fmtDuration(stats.uptime_secs)} · lan-share`;
+      renderStatbar();
     } catch (_) { /* 忽略 */ }
+  }
+
+  function signalLevel(rtt) {
+    if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return 0;
+    if (rtt === null) return 0;
+    if (rtt < 15) return 4;
+    if (rtt < 40) return 3;
+    if (rtt < 100) return 2;
+    return 1;
+  }
+
+  /** 顶部统计条：信号 / 传输中 / 剩余文件 / 分段 / 直播 */
+  function renderStatbar() {
+    const level = signalLevel(state.rtt);
+    const bars = $('#signal-bars');
+    bars.className = 'signal lvl-' + level;
+    Array.from(bars.children).forEach((el, index) => el.classList.toggle('on', index < level));
+    $('#signal-text').textContent =
+      state.rtt === null
+        ? (state.ws && state.ws.readyState === WebSocket.OPEN ? '测速中…' : '未连接')
+        : `延迟 ${Math.round(state.rtt)} ms`;
+
+    let active = 0;
+    let remaining = 0;
+    let remainingBytes = 0;
+    let doneChunks = 0;
+    let totalChunks = 0;
+    for (const job of state.jobs.values()) {
+      if (job.status === 'uploading' || job.status === 'downloading') active += 1;
+      if (job.status === 'uploading' || job.status === 'queued') {
+        remaining += 1;
+        remainingBytes += Math.max(0, job.size - job.loaded);
+      }
+      if (job.chunkCount) {
+        totalChunks += job.chunkCount;
+        doneChunks += job.kind === 'download' ? (job.chunksDone || 0) : countDoneChunks(job);
+      }
+    }
+
+    $('#stat-active').textContent = String(active);
+    $('#stat-remaining').textContent = String(remaining);
+    $('#stat-remaining-bytes').textContent = fmtBytes(remainingBytes);
+    $('#stat-chunks').textContent = `${doneChunks}/${totalChunks}`;
+    const stats = state.serverStats;
+    $('#stat-live').textContent = stats ? String(stats.live) : '0';
+    $('#stat-server').textContent = stats
+      ? `服务端 ${stats.files} 个文件 · ${fmtBytes(stats.bytes)} · 运行 ${fmtDuration(stats.uptime_secs)}`
+      : '服务端 —';
+  }
+
+  function countDoneChunks(job) {
+    if (!job.chunkLoaded) return 0;
+    let done = 0;
+    for (let i = 0; i < job.chunkLoaded.length; i += 1) {
+      if (job.chunkLoaded[i] >= chunkExpectedLen(job, i)) done += 1;
+    }
+    return done;
   }
 
   // ---------------------------------------------------------------- WebSocket
@@ -134,11 +195,29 @@
     }
     state.ws = socket;
 
-    socket.onopen = () => { state.wsRetry = 0; setWsStatus('on'); };
+    socket.onopen = () => {
+      state.wsRetry = 0;
+      setWsStatus('on');
+      // 每 3 秒一次往返测速，用于信号强弱指示
+      clearInterval(state.pingTimer);
+      state.pingTimer = setInterval(() => {
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({ type: 'ping', t: performance.now() }));
+        }
+      }, 3000);
+      socket.send(JSON.stringify({ type: 'ping', t: performance.now() }));
+    };
     socket.onmessage = (event) => {
       let data;
       try { data = JSON.parse(event.data); } catch (_) { return; }
       switch (data.type) {
+        case 'pong': {
+          if (typeof data.t === 'number') {
+            const rtt = performance.now() - data.t;
+            state.rtt = state.rtt === null ? rtt : state.rtt * 0.6 + rtt * 0.4;
+          }
+          break;
+        }
         case 'file_added':
         case 'upload_finished':
           loadFiles();
@@ -154,6 +233,7 @@
       }
     };
     socket.onclose = () => {
+      clearInterval(state.pingTimer);
       setWsStatus('off');
       state.wsRetry = Math.min(state.wsRetry + 1, 6);
       setTimeout(connectWs, 1000 * state.wsRetry);
@@ -457,7 +537,9 @@
     if (job.status === 'queued') {
       job.statusText.textContent = '排队中…';
     } else if (job.status === 'uploading') {
-      job.statusText.textContent = `${fmtBytes(job.loaded)} / ${fmtBytes(job.size)} · ${percent.toFixed(0)}% · ${fmtSpeed(job.speed)}`;
+      const segments = job.chunkCount ? ` · 分段 ${countDoneChunks(job)}/${job.chunkCount}` : '';
+      job.statusText.textContent =
+        `${fmtBytes(job.loaded)} / ${fmtBytes(job.size)} · ${percent.toFixed(0)}% · ${fmtSpeed(job.speed)}${segments}`;
     } else if (job.status === 'done') {
       job.statusText.textContent = `完成 · ${fmtBytes(job.size)}`;
       job.el.querySelector('[data-cancel]')?.remove();
@@ -490,16 +572,24 @@
     button.textContent = '下载中';
     ui.bar.hidden = false;
 
-    const job = { loaded: 0, speed: 0, lastLoaded: 0, lastTs: performance.now() };
+    const job = {
+      kind: 'download',
+      key: 'd-' + Math.random().toString(36).slice(2),
+      file,
+      name: file.name,
+      size: file.size,
+      status: 'downloading',
+      loaded: 0,
+      speed: 0,
+      lastLoaded: 0,
+      lastTs: performance.now(),
+      chunkCount: 0,
+      chunksDone: 0,
+    };
+    state.jobs.set(job.key, job);
     const timer = setInterval(() => {
-      const now = performance.now();
-      const dt = (now - job.lastTs) / 1000;
-      if (dt > 0.2) {
-        job.speed = (job.loaded - job.lastLoaded) / dt;
-        job.lastLoaded = job.loaded;
-        job.lastTs = now;
-        updateDownloadMeta(file, job, ui);
-      }
+      // 速度由全局 ticker 统一计算，这里只负责刷新显示
+      updateDownloadMeta(file, job, ui);
     }, 500);
 
     try {
@@ -516,6 +606,7 @@
       a.remove();
     } finally {
       clearInterval(timer);
+      state.jobs.delete(job.key);
       ui.bar.hidden = true;
       ui.meta.innerHTML = ui.baseMeta;
       button.disabled = false;
@@ -526,12 +617,13 @@
   function updateDownloadMeta(file, job, ui) {
     const percent = file.size ? (job.loaded / file.size) * 100 : 100;
     const eta = job.speed > 0 ? (file.size - job.loaded) / job.speed : Infinity;
+    const segments = job.chunkCount ? `<span>分段 ${job.chunksDone}/${job.chunkCount}</span>` : '';
     ui.barFill.style.width = percent.toFixed(1) + '%';
     ui.meta.innerHTML =
       `<span>${fmtBytes(job.loaded)} / ${fmtBytes(file.size)}</span>` +
       `<span>${percent.toFixed(0)}%</span>` +
       `<span>${fmtSpeed(job.speed)}</span>` +
-      `<span>剩余 ${fmtDuration(eta)}</span>`;
+      `<span>剩余 ${fmtDuration(eta)}</span>` + segments;
   }
 
   async function fetchParallel(file, url, concurrency, job, ui) {
@@ -547,6 +639,8 @@
     const chunkSize = Math.max(1024 * 1024, Math.min(state.serverChunkSize, 32 * 1024 * 1024));
     const count = Math.ceil(total / chunkSize);
     const buffer = new Uint8Array(total);
+    job.chunkCount = count;
+    job.chunksDone = 0;
 
     let cursor = 0;
     const worker = async () => {
@@ -576,6 +670,7 @@
           buffer.set(bytes, start);
           job.loaded += bytes.length;
         }
+        job.chunksDone += 1;
       }
     };
 
@@ -647,14 +742,15 @@
     setInterval(() => {
       const now = performance.now();
       for (const job of state.jobs.values()) {
-        if (job.status !== 'uploading') continue;
+        if (job.status !== 'uploading' && job.status !== 'downloading') continue;
         const dt = (now - job.lastTs) / 1000;
         if (dt < 0.4) continue;
         job.speed = Math.max(0, (job.loaded - job.lastLoaded) / dt);
         job.lastLoaded = job.loaded;
         job.lastTs = now;
-        updateJobRow(job);
+        if (job.status === 'uploading') updateJobRow(job);
       }
+      renderStatbar();
     }, 600);
   }
 
@@ -665,5 +761,5 @@
   loadFiles();
   refreshStats();
   connectWs();
-  setInterval(refreshStats, 30_000);
+  setInterval(refreshStats, 5_000);
 })();

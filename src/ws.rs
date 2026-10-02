@@ -48,6 +48,26 @@ async fn run(mut socket: WebSocket, state: Arc<AppState>) {
                         break;
                     }
                 }
+                Some(Ok(Message::Text(text))) => {
+                    // 网页端用 ping/pong 测往返延迟，用于信号强弱指示
+                    if text.contains("\"ping\"") {
+                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if value.get("type").and_then(|v| v.as_str()) == Some("ping") {
+                                let pong = serde_json::json!({
+                                    "type": "pong",
+                                    "t": value.get("t").cloned().unwrap_or(serde_json::Value::Null),
+                                });
+                                if socket
+                                    .send(Message::Text(pong.to_string().into()))
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
                 Some(Ok(_)) => {}
                 Some(Err(_)) => break,
             },

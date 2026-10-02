@@ -25,6 +25,18 @@
     </div>
   </header>
 
+  <div class="statbar" id="statbar">
+    <span class="stat" title="浏览器到服务端的往返延迟">
+      <span class="signal" id="signal-bars"><i></i><i></i><i></i><i></i></span>
+      <span id="signal-text">测速中…</span>
+    </span>
+    <span class="stat">传输中 <b id="stat-active">0</b></span>
+    <span class="stat">剩余 <b id="stat-remaining">0</b> 个文件 · <b id="stat-remaining-bytes">0 B</b></span>
+    <span class="stat">分段 <b id="stat-chunks">0/0</b></span>
+    <span class="stat">直播 <b id="stat-live">0</b> 路</span>
+    <span class="stat" id="stat-server">服务端 —</span>
+  </div>
+
   <main>
     <nav class="tabs" id="tabs">
       <button class="tab active" type="button" data-tab="files">文件传输</button>
