@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#4f46e5" />
+  <title>局域网互传 · lan-share</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%234f46e5'/%3E%3Cpath d='M16 7v12M16 19l-4.5-4.5M16 19l4.5-4.5M9 24h14' stroke='white' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round' fill='none'/%3E%3C/svg%3E" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">⇅</span>
+      <div>
+        <h1>局域网互传</h1>
+        <p class="sub">同一 WiFi 下，浏览器即可互传文件</p>
+      </div>
+    </div>
+    <div class="status">
+      <span class="dot" id="ws-dot" title="实时连接状态"></span>
+      <span id="ws-text">连接中…</span>
+      <span class="sep">·</span>
+      <span id="stats-text">0 个文件</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="card">
+      <div id="dropzone" class="dropzone" tabindex="0" role="button" aria-label="选择或拖拽文件上传">
+        <div class="dz-icon">⬆</div>
+        <p class="dz-title">把文件拖到这里，或 <span class="link">点击选择</span></p>
+        <p class="dz-hint">支持多文件、超大文件；自动分片并行上传，速度更快</p>
+        <input id="file-input" type="file" multiple hidden />
+      </div>
+
+      <div class="settings">
+        <label class="field">
+          <span>上传并发</span>
+          <select id="upload-concurrency">
+            <option value="1">1（最省带宽）</option>
+            <option value="2">2</option>
+            <option value="4" selected>4（推荐）</option>
+            <option value="6">6</option>
+            <option value="8">8（最快）</option>
+          </select>
+        </label>
+        <label class="field">
+          <span>下载并发</span>
+          <select id="download-concurrency">
+            <option value="1">1（最省带宽）</option>
+            <option value="2">2</option>
+            <option value="4" selected>4（推荐）</option>
+            <option value="6">6</option>
+            <option value="8">8（最快）</option>
+          </select>
+        </label>
+        <span class="hint" id="chunk-hint">分片 8 MiB</span>
+      </div>
+    </section>
+
+    <section class="card" id="tasks-card" hidden>
+      <div class="card-head">
+        <h2>传输队列</h2>
+        <button class="ghost" id="clear-finished" type="button">清除已完成</button>
+      </div>
+      <ul class="tasks" id="task-list"></ul>
+    </section>
+
+    <section class="card">
+      <div class="card-head">
+        <h2>共享文件 <span class="count" id="file-count"></span></h2>
+        <div class="head-actions">
+          <input id="search" type="search" placeholder="搜索文件名…" autocomplete="off" />
+          <button class="ghost" id="refresh" type="button">刷新</button>
+        </div>
+      </div>
+      <ul class="files" id="file-list"></ul>
+      <p class="empty" id="empty-state">还没有文件，拖一个上来试试。</p>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <span id="foot-info"></span>
+  </footer>
+
+  <div class="toasts" id="toasts"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
